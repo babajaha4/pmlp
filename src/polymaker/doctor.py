@@ -101,7 +101,11 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
     check("configured markets accepting orders", tradeable, detail)
 
     # ── live market WS: receive an actual book frame ────────────────────
-    token = held_tokens[0] if held_tokens else await _top_political_token(cfg)
+    configured_token = await _configured_market_token(cfg) if cfg.enabled_markets else None
+    if cfg.enabled_markets:
+        token = configured_token
+    else:
+        token = held_tokens[0] if held_tokens else await _top_political_token(cfg)
     if token:
         passed, detail = await _market_ws_book(token, cfg.proxy)
         check("market WS live book frame", passed, detail)
@@ -177,6 +181,51 @@ async def _top_political_token(cfg: Config) -> str | None:
             toks = json.loads(r.json()[0]["clobTokenIds"])
             return str(toks[0])
     except (httpx.HTTPError, KeyError, IndexError, ValueError):
+        return None
+
+
+async def _configured_market_token(cfg: Config) -> str | None:
+    """Return a token from the first enabled market, never an unrelated position."""
+    from polymaker.catalog.store import CatalogStore
+
+    entry = cfg.enabled_markets[0]
+    store = CatalogStore(cfg.paths.db)
+    try:
+        meta = store.get_by_slug(entry.slug) if entry.slug else None
+        if meta is None and entry.condition_id:
+            meta = store.get(entry.condition_id)
+    finally:
+        store.close()
+    if meta is not None:
+        return meta.yes.token_id
+
+    params: dict[str, Any] = {"limit": 5}
+    if entry.condition_id:
+        params["condition_ids"] = entry.condition_id
+    else:
+        params["slug"] = entry.slug
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(f"{cfg.wallet.gamma_host}/markets", params=params)
+            response.raise_for_status()
+            rows = response.json()
+        if not isinstance(rows, list):
+            return None
+        row = next(
+            (
+                candidate
+                for candidate in rows
+                if (entry.condition_id and candidate.get("conditionId") == entry.condition_id)
+                or (entry.slug and candidate.get("slug") == entry.slug)
+            ),
+            None,
+        )
+        if row is None:
+            return None
+        raw_tokens = row.get("clobTokenIds")
+        tokens = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
+        return str(tokens[0]) if isinstance(tokens, list) and tokens else None
+    except (httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 
 

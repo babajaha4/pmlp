@@ -66,7 +66,8 @@ uv run polymaker run --paper      # explicit paper mode
 uv run polymaker doctor
 
 # 5. self-tests: both commands are LIVE and require an explicit acknowledgement
-uv run polymaker livetest --confirm-live      # place a deep post-only order + cancel
+uv run polymaker livetest --market <enabled-market-slug> --notional 5 --confirm-live
+                                               # deep post-only order, then confirmed cleanup
 uv run polymaker moneydoctor --confirm-live   # limit rest + market buy + market sell
 
 # 6. go live (requires both flags; otherwise the command refuses to start)

@@ -254,7 +254,10 @@ def run(
 @app.command()
 def livetest(
     config_dir: str = typer.Option("config", help="config directory"),
-    notional: float = typer.Option(5.0, help="order notional in USDC"),
+    market: str = typer.Option(..., "--market", help="enabled market slug to test"),
+    notional: float = typer.Option(
+        5.0, min=0.01, max=5.0, help="maximum order notional in USDC"
+    ),
     confirm_live: bool = typer.Option(False, "--confirm-live"),
 ) -> None:
     """Live wallet round-trip: place a deep post-only order and cancel it (~$5)."""
@@ -264,7 +267,7 @@ def livetest(
         console.print("[red]livetest requires --confirm-live.[/red]")
         raise typer.Exit(2)
     cfg = Config.load(config_dir)
-    ok = asyncio.run(run_livetest(cfg, console, notional))
+    ok = asyncio.run(run_livetest(cfg, console, notional, market_slug=market))
     raise typer.Exit(0 if ok else 1)
 
 
