@@ -5,6 +5,7 @@
   polymaker markets-add <slug>   append a market to config/markets.toml
   polymaker status               positions / open orders / PnL (reads SQLite)
   polymaker doctor               preflight: wallet auth, balances, WS reachability
+  polymaker backtest <journal>   replay captured L2 data without network access
   polymaker run [--paper|--live --confirm-live]  start the market maker
   polymaker cancel-all           panic button
 """
@@ -12,8 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -380,6 +382,84 @@ def resume(
     finally:
         store.close()
     console.print("[green]Kill switch cleared after successful preflight.[/green]")
+
+
+@app.command()
+def backtest(
+    journal_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    config_dir: str = typer.Option("config", help="config directory"),
+    queue_ahead: float = typer.Option(
+        1.0, min=0.0, help="fraction of visible size assumed ahead in queue"
+    ),
+    latency_ms: float = typer.Option(250.0, min=0.0, help="quote activation latency"),
+    markout_seconds: float = typer.Option(300.0, min=0.001, help="adverse-selection horizon"),
+    json_output: bool = typer.Option(False, "--json", help="emit machine-readable JSON"),
+) -> None:
+    """Replay a captured L2 journal with conservative maker-fill assumptions."""
+    from polymaker.backtest import (
+        BacktestError,
+        JournalBacktester,
+        ReplayOptions,
+        configured_markets,
+        load_journal,
+    )
+
+    try:
+        cfg = Config.load(config_dir)
+        metas, profiles = configured_markets(cfg)
+        events, malformed = load_journal(journal_path)
+        simulator = JournalBacktester(
+            cfg,
+            metas,
+            profiles,
+            ReplayOptions(
+                queue_ahead_fraction=queue_ahead,
+                quote_latency_ms=latency_ms,
+                markout_seconds=markout_seconds,
+            ),
+        )
+        try:
+            result = simulator.run(events, malformed_lines=malformed)
+        finally:
+            simulator.close()
+    except (BacktestError, OSError, ValueError) as exc:
+        console.print(f"[red]Backtest failed: {exc}[/red]")
+        raise typer.Exit(2) from exc
+
+    if json_output:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+
+    table = Table(title=f"Journal replay · {journal_path.name}")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    rows = (
+        ("Duration", f"{result.duration_seconds:.1f}s"),
+        ("L2 events", str(result.events)),
+        ("Markets", str(result.markets)),
+        ("Orders / fills", f"{result.placed_orders} / {result.fills}"),
+        ("Order fill probability", f"{result.fill_probability:.2%}"),
+        ("Filled notional", f"{result.filled_notional:.4f}"),
+        ("Trading MTM PnL", f"{result.trading_mtm_pnl:+.4f}"),
+        ("Maker rebate estimate", f"{result.maker_rebate_estimate:+.4f}"),
+        ("Liquidity reward estimate", f"{result.liquidity_reward_estimate:+.4f}"),
+        ("Total PnL estimate", f"{result.total_pnl_estimate:+.4f}"),
+        ("Max capital at risk", f"{result.max_capital_at_risk:.4f}"),
+        ("Max drawdown", f"{result.max_drawdown:.4f}"),
+        (
+            f"Mean {markout_seconds:g}s markout",
+            "n/a" if result.mean_markout_bps is None else f"{result.mean_markout_bps:+.2f} bps",
+        ),
+    )
+    for label, value in rows:
+        table.add_row(label, value)
+    console.print(table)
+    if result.malformed_lines:
+        console.print(f"[yellow]Ignored malformed journal lines: {result.malformed_lines}[/yellow]")
+    console.print(
+        "[dim]Reward/rebate figures are model estimates, not realized income. "
+        "Fills require observed trade-through or queue depletion.[/dim]"
+    )
 
 
 if __name__ == "__main__":

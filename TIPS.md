@@ -128,6 +128,7 @@ uv run polymaker run --live --confirm-live  # LIVE maker (ONE instance)
 uv run polymaker cancel-all    # pull every resting order
 uv run polymaker halt          # persist kill switch; scoped to configured tokens
 uv run polymaker resume --confirm
+uv run polymaker backtest journal/paper.jsonl  # offline L2 replay; no wallet calls
 ```
 
 Config lives in `config/*.toml`: `config.toml` (wallet/engine/risk), `strategy.toml`

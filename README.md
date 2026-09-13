@@ -78,7 +78,26 @@ uv run polymaker cancel-all    # panic button
 uv run polymaker halt           # persist kill switch + cancel only configured tokens
 uv run polymaker resume --confirm  # preflight, then clear kill switch
 
+# offline research: replay captured L2 without wallet or network access
+uv run polymaker backtest journal/paper.jsonl
+uv run polymaker backtest journal/paper.jsonl --queue-ahead 1 --latency-ms 250 --json
 ```
+
+### Journal replay assumptions
+
+`backtest` reruns the configured strategy over timestamp-ordered `book`,
+`price_change`, and `last_trade_price` events. Maker fills are conservative: a
+trade must cross the quote, or observed volume at the quote must first consume
+the configured visible queue ahead. The default assumes 100% of displayed size
+is ahead and applies 250 ms quote latency. `--queue-ahead 0` is an optimistic
+upper-bound scenario, not the default.
+
+Trading mark-to-market PnL is reported separately from incentive estimates.
+Maker rebates use simulated fill notional and configured fee metadata. Liquidity
+rewards use a time-weighted L2 score-share approximation against visible in-band
+depth; they are not settled rewards and must not be treated as realized income.
+Adverse-selection markout defaults to 300 seconds and is omitted when the
+journal ends before the horizon.
 
 ## Architecture
 
@@ -139,14 +158,14 @@ Implemented and live-verified end to end (auth → book → strategy → sign �
 cancel): config, catalog/scanner, order book + analytics, strategy (FV,
 vol/toxicity, regime, quoting), state store + lifecycle, execution gateway +
 reconciler + heartbeat, market/user websockets, risk manager, merger, engine,
-CLI, paper mode, journal capture, and fail-closed live safety gates. The offline
-suite is the source of truth for test counts; run `uv run pytest` locally.
+CLI, paper mode, journal capture/replay, conservative maker-fill simulation,
+and fail-closed live safety gates. The offline suite is the source of truth for
+test counts; run `uv run pytest` locally.
 
-Not yet built: a replay backtester over the captured journals, and external data
-feeds (polls / news / cross-venue). Automatic YES+NO merging is disabled by
-default; enable it only after verifying the configured chain contracts and
-builder relayer credentials. Inventory exits remain maker-only limit sells by
-default.
+Not yet built: a continuously stateful paper fill engine and external data feeds
+(polls / news / cross-venue). Automatic YES+NO merging is disabled by default;
+enable it only after verifying the configured chain contracts and builder
+relayer credentials. Inventory exits remain maker-only limit sells by default.
 
 ## License
 
