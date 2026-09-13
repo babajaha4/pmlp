@@ -22,11 +22,6 @@ from polymaker.logging import get_logger
 
 log = get_logger("merge")
 
-# Polygon mainnet contracts (pre-V2 defaults; confirm collateral in the spike).
-CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
-USDC_COLLATERAL = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-
 _CTF_ABI = [
     {
         "name": "mergePositions",
@@ -89,7 +84,7 @@ class Merger:
         from web3.middleware import ExtraDataToPOAMiddleware
 
         rpc = self._cfg.secrets.polygon_rpc or self._cfg.wallet.polygon_rpc
-        w3 = Web3(Web3.HTTPProvider(rpc))
+        w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self._w3 = w3
         self._account = Account.from_key(self._cfg.secrets.pk)
@@ -99,6 +94,10 @@ class Merger:
         """EOA (0) and Gnosis Safe (2) merge on-chain directly. The V2 DepositWallet
         (1/3) merges via the builder relayer — possible only when builder creds are
         configured (self-generate once with clob.create_builder_api_key)."""
+        if not self._cfg.merge.enabled:
+            return False
+        if not self._cfg.secrets.has_wallet:
+            return False
         st = self._cfg.wallet.signature_type
         if st in (0, 2):
             return True
@@ -126,12 +125,16 @@ class Merger:
         cond = _to_bytes32(condition_id)
 
         if neg_risk:
-            c = w3.eth.contract(address=w3.to_checksum_address(NEG_RISK_ADAPTER), abi=_NEG_RISK_ABI)
+            c = w3.eth.contract(
+                address=w3.to_checksum_address(self._cfg.merge.neg_risk_adapter), abi=_NEG_RISK_ABI
+            )
             fn = c.functions.mergePositions(cond, amount_raw)
         else:
-            c = w3.eth.contract(address=w3.to_checksum_address(CONDITIONAL_TOKENS), abi=_CTF_ABI)
+            c = w3.eth.contract(
+                address=w3.to_checksum_address(self._cfg.merge.conditional_tokens), abi=_CTF_ABI
+            )
             fn = c.functions.mergePositions(
-                w3.to_checksum_address(USDC_COLLATERAL),
+                w3.to_checksum_address(self._cfg.merge.collateral_token),
                 b"\x00" * 32,  # parent collection id (top-level market)
                 cond,
                 [1, 2],  # partition: the two outcome slots
@@ -152,7 +155,10 @@ class Merger:
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         h = str(receipt["transactionHash"].hex())
+        status = receipt.get("status", 1)
         log.info("merge_sent", condition=condition_id[:12], amount=amount_raw, tx=h[:14])
+        if status != 1:
+            raise RuntimeError(f"merge reverted: {h}")
         return h
 
     def _inner_merge_call(self, condition_id: str, amount_raw: int, neg_risk: bool) -> tuple[str, str]:
@@ -160,14 +166,15 @@ class Merger:
         w3 = self._w3
         cond = _to_bytes32(condition_id)
         if neg_risk:
-            to = w3.to_checksum_address(NEG_RISK_ADAPTER)
+            to = w3.to_checksum_address(self._cfg.merge.neg_risk_adapter)
             c = w3.eth.contract(address=to, abi=_NEG_RISK_ABI)
             fn = c.functions.mergePositions(cond, amount_raw)
         else:
-            to = w3.to_checksum_address(CONDITIONAL_TOKENS)
+            to = w3.to_checksum_address(self._cfg.merge.conditional_tokens)
             c = w3.eth.contract(address=to, abi=_CTF_ABI)
             fn = c.functions.mergePositions(
-                w3.to_checksum_address(USDC_COLLATERAL), b"\x00" * 32, cond, [1, 2], amount_raw)
+                w3.to_checksum_address(self._cfg.merge.collateral_token),
+                b"\x00" * 32, cond, [1, 2], amount_raw)
         # encode calldata offline (explicit gas/nonce -> no RPC estimation)
         data = fn.build_transaction(
             {"gas": 0, "gasPrice": 0, "nonce": 0, "chainId": self._cfg.wallet.chain_id})["data"]

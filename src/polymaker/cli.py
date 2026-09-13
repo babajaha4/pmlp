@@ -5,7 +5,7 @@
   polymaker markets-add <slug>   append a market to config/markets.toml
   polymaker status               positions / open orders / PnL (reads SQLite)
   polymaker doctor               preflight: wallet auth, balances, WS reachability
-  polymaker run [--paper]        start the market maker
+  polymaker run [--paper|--live --confirm-live]  start the market maker
   polymaker cancel-all           panic button
 """
 
@@ -158,7 +158,8 @@ def pnl(config_dir: str = typer.Option("config", help="config directory")) -> No
         console.print(f"[bold]equity:[/bold] {r['equity']:.4f}  "
                       f"[bold]inventory:[/bold] {r['inventory_value']:.4f}  "
                       f"[bold]net cash:[/bold] {r['net_cash']:.4f}")
-        console.print(f"[bold]daily PnL:[/bold] [{color}]{r['daily_pnl']:+.4f}[/{color}] pUSD")
+        console.print(f"[bold]daily PnL (mark-to-market):[/bold] [{color}]"
+                      f"{r['daily_pnl']:+.4f}[/{color}] pUSD")
     nfills = conn.execute("SELECT COUNT(*) n FROM fills").fetchone()["n"]
     console.print(f"[dim]total fills recorded: {nfills}[/dim]")
     conn.close()
@@ -194,22 +195,35 @@ def doctor(config_dir: str = typer.Option("config", help="config directory")) ->
 def run(
     config_dir: str = typer.Option("config", help="config directory"),
     paper: bool = typer.Option(False, "--paper", help="paper mode: full pipeline, no orders posted"),
+    live: bool = typer.Option(False, "--live", help="enable real order placement"),
+    confirm_live: bool = typer.Option(
+        False, "--confirm-live", help="required acknowledgement for real order placement"
+    ),
 ) -> None:
-    """Start the market maker."""
+    """Start the market maker (paper by default)."""
+    if paper and live:
+        raise typer.BadParameter("--paper and --live are mutually exclusive")
+    if confirm_live and not live:
+        raise typer.BadParameter("--confirm-live requires --live")
+    if live and not confirm_live:
+        console.print("[red]LIVE mode requires both --live and --confirm-live.[/red]")
+        raise typer.Exit(2)
+
     from polymaker.engine import Engine
     from polymaker.logging import configure
 
+    paper_mode = not live
     cfg = Config.load(config_dir)
-    configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper else "live.jsonl"))
+    configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper_mode else "live.jsonl"))
     if cfg.engine.loop == "uvloop":
         try:
-            import uvloop
+            import uvloop  # type: ignore[import-not-found]
 
             uvloop.install()
         except Exception:  # noqa: BLE001
             pass
 
-    engine = Engine(cfg, paper=paper)
+    engine = Engine(cfg, paper=paper_mode)
 
     async def _go() -> None:
         try:
@@ -219,7 +233,16 @@ def run(
         finally:
             await engine.shutdown()
 
-    console.print(f"[bold green]Starting polymaker[/bold green] ({'PAPER' if paper else 'LIVE'})…")
+    mode = "PAPER" if paper_mode else "LIVE"
+    console.print(f"[bold green]Starting polymaker[/bold green] ({mode})…")
+    if not paper_mode:
+        wallet = cfg.secrets.browser_address or cfg.secrets.pk[:10] or "<unset>"
+        console.print(
+            f"[yellow]risk limits: total={cfg.risk.max_total_exposure_usdc:g} "
+            f"market={cfg.risk.max_market_notional_usdc:g} "
+            f"daily-kill={cfg.risk.daily_loss_kill_usdc:g}; "
+            f"markets={len(cfg.enabled_markets)}; wallet={wallet[:10]}…[/yellow]"
+        )
     try:
         asyncio.run(_go())
     except KeyboardInterrupt:
@@ -230,10 +253,14 @@ def run(
 def livetest(
     config_dir: str = typer.Option("config", help="config directory"),
     notional: float = typer.Option(5.0, help="order notional in USDC"),
+    confirm_live: bool = typer.Option(False, "--confirm-live"),
 ) -> None:
     """Live wallet round-trip: place a deep post-only order and cancel it (~$5)."""
     from polymaker.livetest import run_livetest
 
+    if not confirm_live:
+        console.print("[red]livetest requires --confirm-live.[/red]")
+        raise typer.Exit(2)
     cfg = Config.load(config_dir)
     ok = asyncio.run(run_livetest(cfg, console, notional))
     raise typer.Exit(0 if ok else 1)
@@ -242,10 +269,14 @@ def livetest(
 @app.command()
 def moneydoctor(
     config_dir: str = typer.Option("config", help="config directory"),
+    confirm_live: bool = typer.Option(False, "--confirm-live"),
 ) -> None:
     """LIVE trading self-test: rest a limit, then market buy + sell (spends a little)."""
     from polymaker.moneydoctor import run_moneydoctor
 
+    if not confirm_live:
+        console.print("[red]moneydoctor requires --confirm-live.[/red]")
+        raise typer.Exit(2)
     cfg = Config.load(config_dir)
     ok = asyncio.run(run_moneydoctor(cfg, console))
     raise typer.Exit(0 if ok else 1)
@@ -257,14 +288,98 @@ def cancel_all(config_dir: str = typer.Option("config", help="config directory")
     from polymaker.execution.gateway import ExecutionGateway
 
     cfg = Config.load(config_dir)
+    console.print("[bold red]WARNING: this cancels every open order in the wallet.[/bold red]")
     gw = ExecutionGateway(cfg)
 
     async def _go() -> None:
-        await gw.connect()
-        await gw.cancel_all()
+        try:
+            await gw.connect()
+            await gw.cancel_all()
+        finally:
+            gw.close()
 
     asyncio.run(_go())
     console.print("[green]Sent cancel-all.[/green]")
+
+
+@app.command()
+def halt(config_dir: str = typer.Option("config", help="config directory")) -> None:
+    """Persist the kill switch and cancel only this bot's managed tokens."""
+    from polymaker.execution.gateway import ExecutionGateway
+    from polymaker.risk.manager import RiskManager
+    from polymaker.state.store import StateStore
+
+    cfg = Config.load(config_dir)
+    store = StateStore(cfg.paths.db)
+    RiskManager(cfg.risk, store).kill()
+    ok = True
+
+    async def _go() -> None:
+        nonlocal ok
+        from polymaker.engine import Engine
+
+        resolver = Engine(cfg, paper=True)
+        try:
+            await resolver._resolve_markets()
+            if len(resolver.metas) != len(cfg.enabled_markets):
+                ok = False
+                console.print(
+                    "[red]Kill switch persisted, but not all configured markets "
+                    "could be resolved for scoped cancellation.[/red]"
+                )
+                return
+            tokens = {
+                token
+                for meta in resolver.metas.values()
+                for token in (meta.yes.token_id, meta.no.token_id)
+            }
+        finally:
+            resolver.gateway.close()
+            resolver.journal.close()
+            resolver.state.close()
+            resolver.catalog.close()
+
+        gw = ExecutionGateway(cfg)
+        try:
+            await gw.connect()
+            for token in tokens:
+                ok = await gw.cancel_asset(token) and ok
+        finally:
+            gw.close()
+
+    try:
+        asyncio.run(_go())
+    finally:
+        store.close()
+    if not ok:
+        console.print("[red]Kill switch persisted, but one or more cancellations failed.[/red]")
+        raise typer.Exit(1)
+    console.print("[green]Kill switch persisted; managed orders cancelled.[/green]")
+
+
+@app.command()
+def resume(
+    config_dir: str = typer.Option("config", help="config directory"),
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
+    """Run preflight checks, then clear the persistent kill switch."""
+    from polymaker.doctor import run_doctor
+    from polymaker.risk.manager import RiskManager
+    from polymaker.state.store import StateStore
+
+    if not confirm:
+        console.print("[red]resume requires --confirm.[/red]")
+        raise typer.Exit(2)
+    cfg = Config.load(config_dir)
+    if not asyncio.run(run_doctor(cfg, console)):
+        console.print("[red]Preflight failed; kill switch remains active.[/red]")
+        raise typer.Exit(1)
+    store = StateStore(cfg.paths.db)
+    try:
+        RiskManager(cfg.risk, store).resume()
+    finally:
+        store.close()
+    console.print("[green]Kill switch cleared after successful preflight.[/green]")
 
 
 if __name__ == "__main__":

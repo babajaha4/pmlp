@@ -135,10 +135,11 @@ async def test_divergence_corrects_to_onchain(tmp_path, meta):
 
 
 # ── churn bug: resting orders must NOT shrink the size taper ─────────────
-def test_open_orders_do_not_taper_quote_size(tmp_path, meta):
-    """Regression: counting our own resting BUY orders toward market notional
-    collapsed the next quote size to ~0 -> empty targets -> cancel/replace churn.
-    Full resting quotes with zero filled inventory must keep size_scale = 1.0."""
+def test_open_orders_are_hard_reservations_without_taper_churn(tmp_path, meta):
+    """Resting BUYs reserve capital; they do not repeatedly taper themselves.
+
+    A new quote batch is rejected once reservations plus inventory exceed a cap.
+    """
     from polymaker.config import RiskConfig
     from polymaker.domain import OpenOrder, OrderState
     from polymaker.risk.manager import RiskManager
@@ -156,7 +157,7 @@ def test_open_orders_do_not_taper_quote_size(tmp_path, meta):
     # but FILLED inventory near cap DOES taper
     store.apply_fill(Fill(meta.yes.token_id, Side.BUY, 0.2, 70, "f"))  # $14 position
     d2 = rm.evaluate(meta, ws_stale=False, event_group_cost=0.0)
-    assert d2.size_scale < 1.0
+    assert d2.reduce_only and d2.reason == "market_cap"
     store.close()
 
 

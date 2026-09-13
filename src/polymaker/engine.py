@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from polymaker.alerts import Alerter
@@ -21,7 +22,7 @@ from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_marke
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
 from polymaker.domain import Fill, MarketMeta, Regime, Side
-from polymaker.execution.gateway import ExecutionGateway
+from polymaker.execution.gateway import ExecutionGateway, GatewayReadError
 from polymaker.execution.reconciler import reconcile
 from polymaker.journal import Journal
 from polymaker.logging import get_logger
@@ -52,7 +53,8 @@ class Engine:
 
         self.journal = Journal(cfg.paths.journal_dir, enabled=cfg.engine.journal,
                                day="paper" if paper else "live")
-        self.state = StateStore(cfg.paths.db)
+        state_path = _paper_state_path(cfg.paths.db) if paper else cfg.paths.db
+        self.state = StateStore(state_path)
         self.catalog = CatalogStore(cfg.paths.db)
         self.gateway = ExecutionGateway(cfg, self.journal, paper=paper)
         self.risk = RiskManager(cfg.risk, self.state)
@@ -75,6 +77,7 @@ class Engine:
         self._merging: set[str] = set()
         self._token_cid: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
+        self._reservation_lock = asyncio.Lock()  # atomic cross-market exposure reservation
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
         # supervised tasks: name -> (factory, task) so a dead task restarts
@@ -85,6 +88,7 @@ class Engine:
         self._reconcile_now = asyncio.Event()
         self._user_started = False  # user WS task launched (live mode)
         self._hb_was_down = False
+        self._state_unknown = False  # authoritative REST snapshot is unavailable
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
 
     # ── lifecycle ───────────────────────────────────────────────────────
@@ -126,7 +130,6 @@ class Engine:
         for cid in self.metas:
             self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
         self._spawn("supervisor", self._supervise)
-        self.risk.reset_day()
         log.info("engine_started", markets=len(self.metas), paper=self.paper)
 
     def _spawn(self, name: str, factory: Any) -> None:
@@ -164,8 +167,7 @@ class Engine:
             self.user.stop()
         for t in [*self._tasks.values(), *self._aux_tasks]:
             t.cancel()
-        with contextlib.suppress(Exception):
-            await self.gateway.cancel_all()
+        await self._cancel_managed_assets()
         self.gateway.close()
         self.journal.close()
         self.state.close()
@@ -221,32 +223,55 @@ class Engine:
         )
 
     async def _startup_reconcile(self) -> None:
-        with contextlib.suppress(Exception):
-            await self.gateway.cancel_all()  # clean slate; heartbeat covers crashes
-        # cancel-all may have partially failed — verify no orders remain, and
-        # cancel/adopt any stragglers so we never quote on top of an unknown order
-        with contextlib.suppress(Exception):
+        # Never touch orders outside the configured markets. A single wallet may
+        # also contain manual orders or another strategy's orders.
+        if not await self._cancel_managed_assets():
+            raise GatewayReadError("managed-token cancellation could not be confirmed")
+        try:
             leftover = await self.gateway.open_orders()
-            if leftover:
-                log.warning("startup_orders_remain", n=len(leftover))
-                for tok in {o.token_id for o in leftover}:
-                    await self.gateway.cancel_asset(tok)
-                still = await self.gateway.open_orders()
-                for tok in self._token_cid:
-                    self.state.replace_open_orders(
-                        tok, [o for o in still if o.token_id == tok], grace_s=0.0
-                    )
-                if still:
-                    log.error("startup_orders_stuck", n=len(still))
-                    self.alerter.alert("startup_orders_stuck",
-                                       f"{len(still)} orders survived cancel-all", critical=True)
+        except GatewayReadError:
+            self._state_unknown = True
+            raise
+        managed_leftover = [o for o in leftover if o.token_id in self._token_cid]
+        if managed_leftover:
+            self.alerter.alert("startup_orders_stuck",
+                               f"{len(managed_leftover)} managed orders survived cancellation",
+                               critical=True)
+            raise GatewayReadError("managed orders remain after startup cancellation")
+        for tok in self._token_cid:
+            self.state.replace_open_orders(tok, [], grace_s=0.0)
         # purge positions that leaked in for markets we don't trade (manual UI
         # bets etc.) so they can't distort exposure caps or PnL
         self.state.drop_untracked_positions(set(self._token_cid))
         positions = self._only_traded(await self.gateway.positions())
-        if positions:
-            self.state.reconcile_positions(positions)
-            log.info("startup_positions", n=len(positions))
+        self._apply_authoritative_positions(positions)
+        self.risk.establish_daily_baseline()
+        log.info("startup_positions", n=len(positions))
+        self._state_unknown = False
+
+    async def _cancel_managed_assets(self) -> bool:
+        """Cancel only orders on tokens owned by this engine instance."""
+        ok = True
+        for meta in self.metas.values():
+            for tok in (meta.yes.token_id, meta.no.token_id):
+                try:
+                    ok = await self.gateway.cancel_asset(tok) and ok
+                except Exception as exc:  # noqa: BLE001
+                    ok = False
+                    log.critical("managed_cancel_failed", token=tok[:12], err=str(exc))
+        if not ok:
+            self._state_unknown = True
+            self.alerter.alert("managed_cancel_failed",
+                               "could not confirm cancellation for a managed token",
+                               critical=True)
+        return ok
+
+    def _apply_authoritative_positions(self, positions: dict[str, tuple[float, float]]) -> None:
+        """Apply a successful funder snapshot, including explicit zeroes."""
+        self.state.reconcile_positions(positions)
+        for tok in self._token_cid:
+            if tok not in positions and self.state.inflight(tok) == 0:
+                self.state.set_position(tok, 0.0, 0.0)
 
     def _only_traded(self, positions: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
         """Scope account positions to tokens WE trade. Manual/UI positions in
@@ -416,6 +441,7 @@ class Engine:
         )
         halted = cid in self._halted
         blind = market_stale or user_blind or hb_blind or halted
+        blind = blind or self._state_unknown
         if blind:
             log.warning("market_blind", cid=cid[:8], market_stale=market_stale,
                         user_blind=user_blind, hb_blind=hb_blind, halted=halted)
@@ -467,33 +493,52 @@ class Engine:
             else:
                 # cancel MAY have partially applied server-side — keep our view,
                 # resync from REST, and skip placing this cycle (avoid doubles)
-                await self._refresh_token_orders(meta, grace_s=10.0)
+                try:
+                    await self._refresh_token_orders(meta, grace_s=10.0)
+                except GatewayReadError as exc:
+                    self._state_unknown = True
+                    self.alerter.alert("state_unknown", str(exc), critical=True)
+                    log.critical("state_unknown_after_cancel_failure", err=str(exc))
                 self._dirty[cid].set()
                 return
         placed_n = 0
         if plan.to_place:
-            # LOAD SHED: under rate-budget pressure, skip *new* quotes in calm
-            # regimes (cancels/exits above already ran) so we don't inject latency
-            # right when the book is busy. Risk regimes always place.
-            shed = (
-                not self.paper
-                and self.gateway.order_pressure > 0.85
-                and regime in (Regime.QUIET, Regime.TRENDING)
-            )
-            if shed:
-                log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
-                self._dirty[cid].set()  # retry soon
-            else:
-                placed = await self.gateway.place(plan.to_place, meta)
-                placed_n = len(placed)
-                self.risk.note_order_result(len(placed) == len(plan.to_place))
-                for o in placed:
-                    self.state.upsert_order(o)
-                if len(placed) < len(plan.to_place):
-                    # QUARANTINE: a failed/partial batch may still have posted
-                    # orders we don't have ids for. Cancel everything on these
-                    # tokens (idempotent) and resync — never risk an untracked order.
-                    await self._quarantine(meta, reason="place_incomplete")
+            async with self._reservation_lock:
+                fitted = self.risk.fit_reservation(
+                    meta, plan.to_place, event_group_cost=self._event_group_cost(meta)
+                )
+                if not fitted:
+                    log.warning("risk_reservation_rejected", cid=cid[:8], n=len(plan.to_place))
+                    plan = type(plan)(to_cancel=plan.to_cancel, to_place=[])
+                else:
+                    if len(fitted) != len(plan.to_place) or any(
+                        a.size != b.size for a, b in zip(fitted, plan.to_place, strict=False)
+                    ):
+                        log.info("risk_reservation_scaled", cid=cid[:8],
+                                 requested=len(plan.to_place), fitted=len(fitted))
+                    plan = type(plan)(to_cancel=plan.to_cancel, to_place=fitted)
+                    # LOAD SHED: under rate-budget pressure, skip *new* quotes in calm
+                    # regimes (cancels/exits above already ran) so we don't inject latency
+                    # right when the book is busy. Risk regimes always place.
+                    shed = (
+                        not self.paper
+                        and self.gateway.order_pressure > 0.85
+                        and regime in (Regime.QUIET, Regime.TRENDING)
+                    )
+                    if shed:
+                        log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
+                        self._dirty[cid].set()  # retry soon
+                    else:
+                        placed = await self.gateway.place(plan.to_place, meta)
+                        placed_n = len(placed)
+                        self.risk.note_order_result(len(placed) == len(plan.to_place))
+                        for o in placed:
+                            self.state.upsert_order(o)
+                        if len(placed) < len(plan.to_place):
+                            # QUARANTINE: a failed/partial batch may still have posted
+                            # orders we don't have ids for. Cancel everything on these
+                            # tokens (idempotent) and resync — never risk an untracked order.
+                            await self._quarantine(meta, reason="place_incomplete")
         self._last_quote_fv[cid] = fv
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),
@@ -505,10 +550,17 @@ class Engine:
         """Cancel all orders on a market's tokens and resync state from REST."""
         log.warning("quarantine", cid=meta.condition_id[:8], reason=reason)
         for tok in (meta.yes.token_id, meta.no.token_id):
-            await self.gateway.cancel_asset(tok)
+            if not await self.gateway.cancel_asset(tok):
+                self._state_unknown = True
+                return
             for o in self.state.orders_for(tok):
                 self.state.remove_order(o.order_id)
-        await self._refresh_token_orders(meta)
+        try:
+            await self._refresh_token_orders(meta)
+        except GatewayReadError as exc:
+            self._state_unknown = True
+            self.alerter.alert("state_unknown", str(exc), critical=True)
+            log.critical("state_unknown_after_quarantine", err=str(exc))
 
     async def _refresh_token_orders(self, meta: MarketMeta, grace_s: float = 0.0) -> None:
         """Open-orders resync for one market's tokens (grace_s=0 = authoritative)."""
@@ -521,7 +573,7 @@ class Engine:
     def _maybe_merge(self, cid: str, meta: MarketMeta, p: StrategyProfile,
                      yes_size: float, no_size: float) -> None:
         amount = min(yes_size, no_size)
-        if amount < p.merge_min_size or cid in self._merging or self.paper:
+        if amount < p.merge_min_size or cid in self._merging or self.paper or self._state_unknown:
             return
         self._merging.add(cid)
         self._aux_tasks.append(asyncio.create_task(self._merge_task(cid, meta, amount)))
@@ -562,13 +614,17 @@ class Engine:
                 log.warning("heartbeat_recovered_resyncing")
                 self.state.clear_orders()
                 for meta in self.metas.values():
-                    with contextlib.suppress(Exception):
+                    try:
                         await self._refresh_token_orders(meta, grace_s=0.0)
+                    except GatewayReadError as exc:
+                        self._state_unknown = True
+                        log.critical("heartbeat_resync_failed", err=str(exc))
                 self._wake_all()
             await asyncio.sleep(self.cfg.engine.heartbeat_interval_s)
 
     async def _reconcile_loop(self) -> None:
         rounds = 0
+        read_failure_streak = 0
         while self._running:
             # periodic cadence, but wake immediately when a reconnect/recovery
             # demands an urgent resync
@@ -589,8 +645,7 @@ class Engine:
                                        f"{len(expired)} stuck in-flight guards cleared")
 
                 positions = self._only_traded(await self.gateway.positions())
-                if positions:
-                    self.state.reconcile_positions(positions)
+                self._apply_authoritative_positions(positions)
                 live = await self.gateway.open_orders()
                 by_token: dict[str, list[Any]] = {}
                 for o in live:
@@ -610,6 +665,18 @@ class Engine:
                     log.info("forced_reconcile_done", positions=len(positions),
                              open_orders=len(live))
                     self._wake_all()
+                self._state_unknown = False
+                read_failure_streak = 0
+            except GatewayReadError as exc:
+                self._state_unknown = True
+                read_failure_streak += 1
+                self.alerter.alert("state_unknown", str(exc), critical=True)
+                log.critical("state_unknown", err=str(exc))
+                base = max(2.0, self.cfg.engine.reconcile_interval_s)
+                delay = min(60.0, base * (2 ** min(read_failure_streak - 1, 5)))
+                log.warning("reconcile_backoff", failures=read_failure_streak,
+                            delay_s=round(delay, 1))
+                await asyncio.sleep(delay)
             except Exception as exc:  # noqa: BLE001
                 log.warning("reconcile_error", err=str(exc))
 
@@ -761,8 +828,10 @@ class Engine:
         for m in self.metas.values():
             if m.event_id == meta.event_id:
                 for tok in (m.yes.token_id, m.no.token_id):
-                    pos = self.state.position(tok)
-                    cost += pos.size * pos.avg_price
+                    cost += self.risk.marked_position_notional(tok)
+                    cost += sum(
+                        o.notional for o in self.state.orders_for(tok) if o.side is Side.BUY
+                    )
         return cost
 
 
@@ -794,3 +863,11 @@ def _empty_view() -> Any:
     from polymaker.marketdata.orderbook import BookView
 
     return BookView(None, 0.0, None, 0.0, None, None, 0.0, 0.0)
+
+
+def _paper_state_path(db_path: str) -> str:
+    if db_path == ":memory:":
+        return db_path
+    path = Path(db_path)
+    suffix = path.suffix or ".db"
+    return str(path.with_name(f"{path.stem}.paper{suffix}"))

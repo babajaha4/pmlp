@@ -42,6 +42,17 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
     ts        REAL PRIMARY KEY,
     equity    REAL, net_cash REAL, inventory_value REAL, daily_pnl REAL
 );
+CREATE TABLE IF NOT EXISTS risk_state (
+    day_key           TEXT PRIMARY KEY,
+    day_start_equity  REAL NOT NULL,
+    net_cash          REAL NOT NULL,
+    daily_pnl         REAL NOT NULL DEFAULT 0,
+    killed            INTEGER NOT NULL DEFAULT 0,
+    manual_killed     INTEGER NOT NULL DEFAULT 0,
+    order_attempts    INTEGER NOT NULL DEFAULT 0,
+    order_errors      INTEGER NOT NULL DEFAULT 0,
+    updated_ts        REAL NOT NULL
+);
 """
 
 
@@ -53,6 +64,17 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        risk_columns = {
+            str(row["name"]) for row in self._conn.execute("PRAGMA table_info(risk_state)")
+        }
+        if "daily_pnl" not in risk_columns:
+            self._conn.execute(
+                "ALTER TABLE risk_state ADD COLUMN daily_pnl REAL NOT NULL DEFAULT 0"
+            )
+        if "manual_killed" not in risk_columns:
+            self._conn.execute(
+                "ALTER TABLE risk_state ADD COLUMN manual_killed INTEGER NOT NULL DEFAULT 0"
+            )
         self._conn.commit()
 
         self.positions: dict[str, Position] = {}
@@ -197,6 +219,65 @@ class StateStore:
     def clear_orders(self) -> None:
         """Forget all local open orders (e.g. after a confirmed server-side wipe)."""
         self.orders.clear()
+
+    # ── risk-state persistence ──────────────────────────────────────────
+    def load_risk_state(self, day_key: str) -> dict[str, float | int] | None:
+        row = self._conn.execute(
+            "SELECT day_start_equity, net_cash, daily_pnl, killed, manual_killed, "
+            "order_attempts, order_errors "
+            "FROM risk_state WHERE day_key=?",
+            (day_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "day_start_equity": float(row["day_start_equity"]),
+            "net_cash": float(row["net_cash"]),
+            "daily_pnl": float(row["daily_pnl"]),
+            "killed": int(row["killed"]),
+            "manual_killed": int(row["manual_killed"]),
+            "order_attempts": int(row["order_attempts"]),
+            "order_errors": int(row["order_errors"]),
+        }
+
+    def latest_risk_state(self) -> dict[str, float | int | str] | None:
+        row = self._conn.execute(
+            "SELECT day_key, day_start_equity, net_cash, daily_pnl, killed, manual_killed, "
+            "order_attempts, order_errors FROM risk_state ORDER BY day_key DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "day_key": str(row["day_key"]),
+            "day_start_equity": float(row["day_start_equity"]),
+            "net_cash": float(row["net_cash"]),
+            "daily_pnl": float(row["daily_pnl"]),
+            "killed": int(row["killed"]),
+            "manual_killed": int(row["manual_killed"]),
+            "order_attempts": int(row["order_attempts"]),
+            "order_errors": int(row["order_errors"]),
+        }
+
+    def save_risk_state(
+        self,
+        day_key: str,
+        *,
+        day_start_equity: float,
+        net_cash: float,
+        daily_pnl: float,
+        killed: bool,
+        manual_killed: bool,
+        order_attempts: int,
+        order_errors: int,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO risk_state "
+            "(day_key,day_start_equity,net_cash,daily_pnl,killed,manual_killed,"
+            "order_attempts,order_errors,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)",
+            (day_key, day_start_equity, net_cash, daily_pnl, int(killed), int(manual_killed),
+             order_attempts, order_errors, time.time()),
+        )
+        self._conn.commit()
 
     # ── persistence ─────────────────────────────────────────────────────
     def _persist_position(self, pos: Position) -> None:

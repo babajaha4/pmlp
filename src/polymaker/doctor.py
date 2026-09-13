@@ -57,6 +57,7 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
     creds: Any = None
     funder = ""
     held_tokens: list[str] = []
+    gw: Any = None
     if cfg.secrets.has_wallet:
         try:
             from polymaker.execution.gateway import ExecutionGateway
@@ -81,15 +82,23 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
             total_shares = sum(sz for sz, _ in positions.values())
             check("positions readable (on funder)", True,
                   f"{len(positions)} positions, {total_shares:.0f} shares total")
+            orders = await gw.open_orders()
+            check("open orders readable", True, f"{len(orders)} open orders")
         except Exception as e:  # noqa: BLE001
             check("wallet auth (L2 creds derived)", False, str(e))
             console.print("  [yellow]! signature-type mismatch? deposit wallets use sig_type=3 "
                           "(config.toml). See the README.[/yellow]")
+        finally:
+            if gw is not None:
+                gw.close()
     else:
         console.print("  [yellow]! skipping wallet checks (no secrets)[/yellow]")
 
     if cfg.proxy:
         console.print(f"  [dim]· routing via proxy {cfg.proxy.split('@')[-1]}[/dim]")
+
+    tradeable, detail = await _configured_markets_tradeable(cfg)
+    check("configured markets accepting orders", tradeable, detail)
 
     # ── live market WS: receive an actual book frame ────────────────────
     token = held_tokens[0] if held_tokens else await _top_political_token(cfg)
@@ -169,6 +178,38 @@ async def _top_political_token(cfg: Config) -> str | None:
             return str(toks[0])
     except (httpx.HTTPError, KeyError, IndexError, ValueError):
         return None
+
+
+async def _configured_markets_tradeable(cfg: Config) -> tuple[bool, str]:
+    entries = cfg.enabled_markets
+    if not entries:
+        return True, "no enabled markets"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for entry in entries:
+                params: dict[str, Any] = {"limit": 5}
+                if entry.condition_id:
+                    params["condition_ids"] = entry.condition_id
+                else:
+                    params["slug"] = entry.slug
+                response = await client.get(f"{cfg.wallet.gamma_host}/markets", params=params)
+                response.raise_for_status()
+                rows = response.json()
+                if not isinstance(rows, list) or not rows:
+                    return False, f"market not found: {entry.ref}"
+                market = next(
+                    (
+                        row for row in rows
+                        if (entry.condition_id and row.get("conditionId") == entry.condition_id)
+                        or (entry.slug and row.get("slug") == entry.slug)
+                    ),
+                    None,
+                )
+                if market is None or market.get("closed") or not market.get("acceptingOrders"):
+                    return False, f"closed/not accepting: {entry.ref}"
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        return False, str(exc)[:80]
+    return True, f"{len(entries)} markets checked"
 
 
 def _extract_balance(ba: dict[str, Any]) -> float | None:

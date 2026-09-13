@@ -59,21 +59,25 @@ uv run polymaker markets
 uv run polymaker markets-add <slug> --profile political-longdated
 
 # 3. dry run: full pipeline against the live feed, no orders posted
-uv run polymaker run --paper
+uv run polymaker run              # paper is the safe default
+uv run polymaker run --paper      # explicit paper mode
 
 # 4. preflight the wallet before going live
 uv run polymaker doctor
 
-# 5. self-tests: a deep post-only order (free), then a real fill round-trip (~cents)
-uv run polymaker livetest      # place a deep post-only order + cancel (no fill)
-uv run polymaker moneydoctor   # limit rest + market buy + market sell, auto-flattens
+# 5. self-tests: both commands are LIVE and require an explicit acknowledgement
+uv run polymaker livetest --confirm-live      # place a deep post-only order + cancel
+uv run polymaker moneydoctor --confirm-live   # limit rest + market buy + market sell
 
-# 6. go live
-uv run polymaker run
+# 6. go live (requires both flags; otherwise the command refuses to start)
+uv run polymaker run --live --confirm-live
 
 # ops
 uv run polymaker status        # positions / open orders
 uv run polymaker cancel-all    # panic button
+uv run polymaker halt           # persist kill switch + cancel only configured tokens
+uv run polymaker resume --confirm  # preflight, then clear kill switch
+
 ```
 
 ## Architecture
@@ -134,13 +138,15 @@ uv run mypy src               # types (strict)
 Implemented and live-verified end to end (auth → book → strategy → sign → post →
 cancel): config, catalog/scanner, order book + analytics, strategy (FV,
 vol/toxicity, regime, quoting), state store + lifecycle, execution gateway +
-reconciler + heartbeat, market/user websockets, risk manager, merger (EOA path),
-engine, CLI, paper mode, journal capture. 83 tests; ruff + mypy strict clean.
+reconciler + heartbeat, market/user websockets, risk manager, merger, engine,
+CLI, paper mode, journal capture, and fail-closed live safety gates. The offline
+suite is the source of truth for test counts; run `uv run pytest` locally.
 
 Not yet built: a replay backtester over the captured journals, and external data
-feeds (polls / news / cross-venue). Merging through a Safe/proxy wallet routes a
-tx via the relayer and isn't wired yet — until then inventory exits via limit
-sells rather than merging.
+feeds (polls / news / cross-venue). Automatic YES+NO merging is disabled by
+default; enable it only after verifying the configured chain contracts and
+builder relayer credentials. Inventory exits remain maker-only limit sells by
+default.
 
 ## License
 

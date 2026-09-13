@@ -11,6 +11,7 @@ Secrets (private key, wallet address) come only from the environment / .env.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -55,11 +56,50 @@ class RiskConfig(BaseModel):
     heartbeat_halt_failures: int = 3
     max_order_error_rate: float = 0.25
 
+    @model_validator(mode="after")
+    def _validate_limits(self) -> RiskConfig:
+        limits = (
+            self.max_total_exposure_usdc,
+            self.max_event_group_loss_usdc,
+            self.max_market_notional_usdc,
+            self.daily_loss_kill_usdc,
+        )
+        if any(v <= 0 for v in limits):
+            raise ValueError("risk limits must be positive")
+        if not 0 < self.max_order_error_rate <= 1:
+            raise ValueError("max_order_error_rate must be in (0, 1]")
+        return self
+
 
 class ExecutionConfig(BaseModel):
     rate_budget_fraction: float = 0.25
     post_only: bool = True
     max_orders_per_batch: int = 15
+
+    @model_validator(mode="after")
+    def _validate_limits(self) -> ExecutionConfig:
+        if not 0 < self.rate_budget_fraction <= 1:
+            raise ValueError("rate_budget_fraction must be in (0, 1]")
+        if self.max_orders_per_batch <= 0:
+            raise ValueError("max_orders_per_batch must be positive")
+        return self
+
+
+class MergeConfig(BaseModel):
+    """Explicit opt-in for on-chain YES+NO position merging."""
+
+    enabled: bool = False
+    conditional_tokens: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    neg_risk_adapter: str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+    collateral_token: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+    @model_validator(mode="after")
+    def _validate_addresses(self) -> MergeConfig:
+        for name in ("conditional_tokens", "neg_risk_adapter", "collateral_token"):
+            value = getattr(self, name)
+            if re.fullmatch(r"0x[0-9a-fA-F]{40}", value) is None:
+                raise ValueError(f"merge.{name} must be a checksummed or hex address")
+        return self
 
 
 class PathsConfig(BaseModel):
@@ -192,6 +232,7 @@ class Config(BaseModel):
     engine: EngineConfig = EngineConfig()
     risk: RiskConfig = RiskConfig()
     execution: ExecutionConfig = ExecutionConfig()
+    merge: MergeConfig = MergeConfig()
     paths: PathsConfig = PathsConfig()
     profiles: dict[str, StrategyProfile] = {}
     markets: list[MarketEntry] = []
@@ -235,6 +276,7 @@ class Config(BaseModel):
             engine=EngineConfig(**main.get("engine", {})),
             risk=RiskConfig(**main.get("risk", {})),
             execution=ExecutionConfig(**main.get("execution", {})),
+            merge=MergeConfig(**main.get("merge", {})),
             paths=PathsConfig(**main.get("paths", {})),
             profiles=profiles,
             markets=markets,

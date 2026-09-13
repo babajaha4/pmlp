@@ -6,7 +6,8 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
 
 ## Running & watching
 
-- **Run exactly ONE engine.** `uv run polymaker run`. If you background it, verify
+- **Run exactly ONE engine.** `uv run polymaker run` is paper mode; LIVE requires
+  `uv run polymaker run --live --confirm-live`. If you background it, verify
   with `pgrep -f "polymaker run"` and `grep -c engine_started <logfile>` — two
   engines on the same wallet race each other and double-order. (The process tree
   is zsh→uv→python, so ~3 procs but only **one** `engine_started` line.)
@@ -121,9 +122,12 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
 ```bash
 uv run polymaker scan          # discover + rank markets -> markets.csv, state.db
 uv run polymaker doctor        # preflight: wallet, clock, WS, balances
-uv run polymaker moneydoctor   # live buy/sell/limit self-test (spends a little)
-uv run polymaker run           # start the maker (ONE instance)
+uv run polymaker moneydoctor --confirm-live  # live self-test (spends a little)
+uv run polymaker run           # paper maker (ONE instance)
+uv run polymaker run --live --confirm-live  # LIVE maker (ONE instance)
 uv run polymaker cancel-all    # pull every resting order
+uv run polymaker halt          # persist kill switch; scoped to configured tokens
+uv run polymaker resume --confirm
 ```
 
 Config lives in `config/*.toml`: `config.toml` (wallet/engine/risk), `strategy.toml`

@@ -32,6 +32,10 @@ log = get_logger("execution.gateway")
 _T = TypeVar("_T")
 
 
+class GatewayReadError(RuntimeError):
+    """A required exchange snapshot could not be read authoritatively."""
+
+
 def _tick_str(tick: float) -> str:
     return f"{tick:g}"
 
@@ -336,7 +340,7 @@ class ExecutionGateway:
                     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
                     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
                     ctf = w3.eth.contract(
-                        address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                        address=Web3.to_checksum_address(self._cfg.merge.conditional_tokens),
                         abi=abi,
                     )
                     raw = ctf.functions.balanceOf(
@@ -377,7 +381,7 @@ class ExecutionGateway:
                     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
                     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
                     ctf = w3.eth.contract(
-                        address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                        address=Web3.to_checksum_address(self._cfg.merge.conditional_tokens),
                         abi=abi,
                     )
                     funder = Web3.to_checksum_address(self.funder)
@@ -448,7 +452,15 @@ class ExecutionGateway:
 
         def _get() -> list[OpenOrder]:
             raw = self._client.get_open_orders()
-            rows = raw if isinstance(raw, list) else raw.get("data", raw.get("orders", []))
+            rows: Any
+            if isinstance(raw, list):
+                rows = raw
+            elif isinstance(raw, dict) and ("data" in raw or "orders" in raw):
+                rows = raw.get("data", raw.get("orders"))
+            else:
+                raise ValueError("unexpected open-orders response shape")
+            if not isinstance(rows, list):
+                raise ValueError("open-orders payload is not a list")
             out = []
             for r in rows:
                 try:
@@ -466,15 +478,15 @@ class ExecutionGateway:
                             OrderState.LIVE,
                         )
                     )
-                except (KeyError, ValueError, TypeError):
-                    continue
+                except (KeyError, ValueError, TypeError) as exc:
+                    raise ValueError("malformed open order in snapshot") from exc
             return out
 
         try:
             return await self._io(_get)
         except Exception as exc:  # noqa: BLE001
             log.warning("open_orders_failed", err=str(exc))
-            return []
+            raise GatewayReadError("open-orders snapshot unavailable") from exc
 
     async def positions(self) -> dict[str, tuple[float, float]]:
         """{token_id: (size, avg_price)} from the data API (reconcile use).
@@ -482,8 +494,10 @@ class ExecutionGateway:
         Queries the FUNDER (where positions live), not the signer EOA.
         """
         user = self.funder
-        if not user or not user.startswith("0x") or user == "0xPAPER":
+        if user == "0xPAPER":
             return {}
+        if not user or not user.startswith("0x"):
+            raise GatewayReadError("positions snapshot unavailable: invalid funder")
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
                 r = await c.get(f"{self._data_host}/positions", params={"user": user})
@@ -493,14 +507,16 @@ class ExecutionGateway:
                     for p in r.json()
                     if float(p.get("size", 0)) > 0
                 }
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - a snapshot failure is fail-closed
             log.warning("positions_failed", err=str(exc))
-            return {}
+            raise GatewayReadError("positions snapshot unavailable") from exc
 
     async def balance_allowance(self) -> dict[str, Any]:
         """Collateral balance/allowance snapshot (for `doctor`)."""
         if self._client is None:
-            return {}
+            if self._paper:
+                return {}
+            raise GatewayReadError("balance/allowance snapshot unavailable: gateway not connected")
 
         def _get() -> dict[str, Any]:
             from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
@@ -514,7 +530,7 @@ class ExecutionGateway:
             return await self._io(_get)
         except Exception as exc:  # noqa: BLE001
             log.warning("balance_allowance_failed", err=str(exc))
-            return {}
+            raise GatewayReadError("balance/allowance snapshot unavailable") from exc
 
     def _journal_write(self, kind: str, payload: Any, ts: float) -> None:
         if self._journal is not None:

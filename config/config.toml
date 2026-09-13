@@ -34,7 +34,7 @@ loop = "uvloop"                 # "uvloop" | "asyncio"
 max_total_exposure_usdc = 450.0     # sum of |position notional| + open buy notional
 max_event_group_loss_usdc = 400.0   # neg-risk group worst-case loss cap
 max_market_notional_usdc = 400.0     # per-market position+orders notional cap
-daily_loss_kill_usdc = 40.0         # realized daily loss -> halt new quotes
+daily_loss_kill_usdc = 40.0         # mark-to-market daily loss -> halt new quotes
 ws_stale_halt_s = 10.0               # no book updates for this long -> halt market
 user_ws_blind_halt_s = 15.0          # user WS down this long -> pull all quotes (can't see fills)
 heartbeat_halt_failures = 3          # consecutive heartbeat misses -> halt + resync
@@ -44,6 +44,9 @@ max_order_error_rate = 0.25          # rolling order-post error fraction -> halt
 rate_budget_fraction = 0.25     # fraction of documented API limits we allow
 post_only = true                # every quote is post-only (maker-only mandate)
 max_orders_per_batch = 15       # exchange batch cap
+
+[merge]
+enabled = false                 # explicit opt-in; maker-only exits remain the default
 
 [paths]
 db = "state.db"

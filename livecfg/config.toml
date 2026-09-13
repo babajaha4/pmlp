@@ -20,7 +20,7 @@ loop = "uvloop"
 max_total_exposure_usdc = 40.0       # hard ceiling on deployed capital
 max_event_group_loss_usdc = 30.0
 max_market_notional_usdc = 15.0      # per-market cap
-daily_loss_kill_usdc = 12.0          # stop trading if we lose ~$12
+daily_loss_kill_usdc = 12.0          # stop trading at ~$12 mark-to-market loss
 ws_stale_halt_s = 8.0
 user_ws_blind_halt_s = 12.0
 heartbeat_halt_failures = 3
@@ -30,6 +30,9 @@ max_order_error_rate = 0.25
 rate_budget_fraction = 0.15
 post_only = true
 max_orders_per_batch = 15
+
+[merge]
+enabled = false
 
 [paths]
 db = "livecfg/state.db"

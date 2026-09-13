@@ -125,7 +125,7 @@ class CatalogStore:
             "rebate_pct", "rewards_max_spread", "liquidity", "volume_24h",
             "end_date", "question", "slug", "condition_id",
         ]
-        with open(path, "w", newline="") as fh:
+        with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(fields)
             for m, sc in rows:

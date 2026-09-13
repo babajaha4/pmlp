@@ -472,6 +472,7 @@ cython_debug/
 # polymaker v2
 .venv/
 state.db
+state.paper.db
 state.db-*
 journal/
 logs/
@@ -479,3 +480,6 @@ positions/
 data/
 *.whl
 session/
+
+# Keep the shareable environment template; all populated .env files stay ignored.
+!.env.example

@@ -89,3 +89,14 @@ def test_store_upsert_is_idempotent(tmp_path):
     store.upsert_market(m)  # second time updates, not duplicates
     assert len(store.top(10)) == 1
     store.close()
+
+
+def test_export_csv_writes_unicode_as_utf8(tmp_path):
+    store = CatalogStore(tmp_path / "s.db")
+    market = parse_market({**RAW, "question": "Will Luccić win?"}, {"0xabc": 42.0})
+    store.upsert_market(market)
+
+    output = tmp_path / "markets.csv"
+    assert store.export_csv(output) == 1
+    assert "Will Luccić win?" in output.read_text(encoding="utf-8")
+    store.close()
