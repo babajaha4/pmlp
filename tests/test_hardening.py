@@ -70,13 +70,19 @@ def test_retrying_keeps_fill_failed_reverses_once(tmp_path):
     FAILED reverses exactly once, even if FAILED is replayed."""
     s = StateStore(tmp_path / "s.db")
     p = UserEventProcessor(s)
-    p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.MATCHED, 1.0), "cid")
-    p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.RETRYING, 2.0), "cid")
+    assert p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.MATCHED, 1.0), "cid") is True
+    assert p.on_trade(
+        TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.RETRYING, 2.0), "cid"
+    ) is False
     assert s.position("tok").size == 100  # retrying: unchanged
     assert s.inflight("tok") == 1
-    p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.FAILED, 3.0), "cid")
+    assert p.on_trade(
+        TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.FAILED, 3.0), "cid"
+    ) is True
     assert s.position("tok").size == 0  # reversed
-    p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.FAILED, 4.0), "cid")
+    assert p.on_trade(
+        TradeEvent("tok", Side.BUY, 0.5, 100, "t1", TradeState.FAILED, 4.0), "cid"
+    ) is False
     assert s.position("tok").size == 0  # replayed FAILED: no double reverse
     s.close()
 

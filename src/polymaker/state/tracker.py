@@ -101,20 +101,26 @@ class UserEventProcessor:
             return False
 
         elif ev.status is TradeState.FAILED:
-            prior = self._applied.pop(ev.trade_id, None)
+            prior = self._applied.get(ev.trade_id)
             if prior is not None:
                 # reverse the optimistic fill (idempotent via the :reverse id)
                 reverse = Fill(
                     prior.token_id, prior.side.opposite, prior.price, prior.size,
                     f"{prior.trade_id}:reverse", prior.ts, is_maker=True,
                 )
-                if not self._store.apply_fill(reverse):
+                if self._store.apply_fill(reverse):
+                    self._applied.pop(ev.trade_id)
+                    self._store.clear_inflight(ev.token_id)
+                    log.warning("trade_failed_reversed", trade_id=ev.trade_id, token=ev.token_id[:12])
+                    self._on_fill(reverse)
+                    self._on_change(condition_id)
+                    return True
+                if self._store.has_fill(reverse.trade_id):
+                    # A concurrent/replayed reversal is already durable. Finish
+                    # the local lifecycle without re-emitting side effects.
+                    self._applied.pop(ev.trade_id)
+                    self._store.clear_inflight(ev.token_id)
                     return False
-                self._store.clear_inflight(ev.token_id)
-                log.warning("trade_failed_reversed", trade_id=ev.trade_id, token=ev.token_id[:12])
-                self._on_fill(reverse)
-                self._on_change(condition_id)
-                return True
 
         return False
 

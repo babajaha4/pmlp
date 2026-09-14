@@ -133,6 +133,12 @@ class StateStore:
                  price=fill.price, size=fill.size, pos=round(pos.size, 2))
         return True
 
+    def has_fill(self, trade_id: str) -> bool:
+        """Return whether the exact fill ID has already been persisted."""
+        return self._conn.execute(
+            "SELECT 1 FROM fills WHERE trade_id=? LIMIT 1", (trade_id,)
+        ).fetchone() is not None
+
     def set_position(self, token_id: str, size: float, avg_price: float) -> None:
         pos = Position(token_id, max(0.0, size), avg_price if size > 0 else 0.0)
         self.positions[token_id] = pos

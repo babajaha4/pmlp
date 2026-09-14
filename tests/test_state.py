@@ -73,10 +73,17 @@ def test_matched_then_confirmed(tmp_path):
     s = StateStore(tmp_path / "s.db")
     changed: list[str] = []
     p = UserEventProcessor(s, on_change=changed.append)
-    p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "trade1", TradeState.MATCHED, 1.0), "cid")
+    assert p.on_trade(
+        TradeEvent("tok", Side.BUY, 0.5, 100, "trade1", TradeState.MATCHED, 1.0), "cid"
+    ) is True
     assert s.position("tok").size == 100
     assert s.inflight("tok") == 1
-    p.on_trade(TradeEvent("tok", Side.BUY, 0.5, 100, "trade1", TradeState.CONFIRMED, 2.0), "cid")
+    assert p.on_trade(
+        TradeEvent("tok", Side.BUY, 0.5, 100, "trade1", TradeState.MINED, 1.5), "cid"
+    ) is False
+    assert p.on_trade(
+        TradeEvent("tok", Side.BUY, 0.5, 100, "trade1", TradeState.CONFIRMED, 2.0), "cid"
+    ) is False
     assert s.inflight("tok") == 0
     assert s.position("tok").size == 100  # settled
     assert changed == ["cid", "cid"]
@@ -87,8 +94,8 @@ def test_matched_is_idempotent(tmp_path):
     s = StateStore(tmp_path / "s.db")
     p = UserEventProcessor(s)
     ev = TradeEvent("tok", Side.BUY, 0.5, 100, "trade1", TradeState.MATCHED, 1.0)
-    p.on_trade(ev, "cid")
-    p.on_trade(ev, "cid")  # duplicate MATCHED for same trade id
+    assert p.on_trade(ev, "cid") is True
+    assert p.on_trade(ev, "cid") is False  # duplicate MATCHED for same trade id
     assert s.position("tok").size == 100  # not doubled
     s.close()
 
@@ -126,6 +133,44 @@ def test_failed_trade_reverses_position_and_cash_callback(tmp_path):
     assert processor.on_trade(failed, "cid") is True
     assert store.position("tok").size == 0
     assert [(f.side, f.size) for f in cash_events] == [(Side.BUY, 10), (Side.SELL, 10)]
+    store.close()
+
+
+def test_duplicate_reverse_clears_lifecycle_without_callbacks(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    cash_events: list[Fill] = []
+    processor = UserEventProcessor(store, on_fill=cash_events.append)
+    matched = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.MATCHED, 1.0)
+    failed = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.FAILED, 2.0)
+    assert processor.on_trade(matched, "cid") is True
+    assert store.apply_fill(Fill("tok", Side.SELL, 0.5, 10, "t:o:reverse", 1.0, True)) is True
+
+    assert processor.on_trade(failed, "cid") is False
+    assert store.inflight("tok") == 0
+    assert cash_events == [Fill("tok", Side.BUY, 0.5, 10, "t:o", 1.0, True)]
+    store.close()
+
+
+def test_failed_retries_reverse_when_insert_does_not_persist(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    processor = UserEventProcessor(store)
+    matched = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.MATCHED, 1.0)
+    failed = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.FAILED, 2.0)
+    assert processor.on_trade(matched, "cid") is True
+    original_apply_fill = store.apply_fill
+
+    def reject_reverse(fill: Fill) -> bool:
+        return False if fill.trade_id == "t:o:reverse" else original_apply_fill(fill)
+
+    store.apply_fill = reject_reverse  # type: ignore[method-assign]
+    assert processor.on_trade(failed, "cid") is False
+    assert store.inflight("tok") == 1
+    assert store.position("tok").size == 10
+
+    store.apply_fill = original_apply_fill  # type: ignore[method-assign]
+    assert processor.on_trade(failed, "cid") is True
+    assert store.inflight("tok") == 0
+    assert store.position("tok").size == 0
     store.close()
 
 
