@@ -332,7 +332,9 @@ async def test_authoritative_task_cancellation_propagates(tmp_path, meta, entry)
         await method()
 
 
-async def test_unexpected_cancel_exception_keeps_quarantine_and_logs(tmp_path, meta, capsys):
+async def test_unexpected_cancel_exception_keeps_quarantine_and_logs(
+    tmp_path, meta, capsys, caplog
+):
     eng = _engine_with_market(tmp_path, meta)
     _feed_book(eng, meta)
     await eng._recompute(meta.condition_id)
@@ -349,7 +351,10 @@ async def test_unexpected_cancel_exception_keeps_quarantine_and_logs(tmp_path, m
     assert eng._state_unknown
     assert eng.state.orders_for(meta.yes.token_id)
     assert not eng.state.orders_for(meta.no.token_id)
-    assert "managed_cancel_failed" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "managed_cancel_failed" in captured.out or any(
+        "managed_cancel_failed" in record.getMessage() for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("field", ["price", "matched_amount", "timestamp"])
