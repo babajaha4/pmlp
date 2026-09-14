@@ -28,10 +28,11 @@ dependencies = [
 [project.scripts]
 polymaker = "polymaker.cli:app"
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
+    "pytest-cov>=6",
     "respx>=0.22",
     "ruff>=0.9",
     "mypy>=1.14",

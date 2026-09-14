@@ -29,9 +29,14 @@ tested.
 Uses [uv](https://docs.astral.sh/uv/) and Python 3.12+.
 
 ```bash
-uv sync --extra dev          # install deps + dev tools
+uv sync                      # install runtime + default dev/test tools
 uv run polymaker --help
 ```
+
+The default `dev` dependency group includes pytest, async and HTTP test support,
+coverage, Ruff, and Mypy, so a normal deployment `uv sync` restores the complete
+test environment. Use `uv sync --no-dev` only for an intentionally runtime-only
+environment.
 
 ## Configure
 
