@@ -9,11 +9,12 @@ from rich.console import Console
 
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config
-from polymaker.domain import MarketMeta, Quote, Side
+from polymaker.domain import MarketMeta, OrderState, Quote, Side
 from polymaker.execution.gateway import ExecutionGateway
 
 _MAX_TEST_NOTIONAL_USDC = 5.0
 _DEEP_OFFSET = 0.10
+_READBACK_DELAYS_S = (0.5, 1.0, 2.0, 4.0, 4.0)
 
 
 async def run_livetest(
@@ -106,14 +107,7 @@ async def run_livetest(
             order_id = placed[0].order_id
             console.print(f"  [green]OK[/green] placed - order id {order_id[:16]}...")
             if not cancel_requested:
-                await asyncio.sleep(2.0)
-                live = await gw.open_orders()
-                observed_resting = any(order.order_id == order_id for order in live)
-                console.print(
-                    f"  [{'green' if observed_resting else 'red'}]"
-                    f"{'OK' if observed_resting else 'FAIL'}[/] order readback "
-                    f"{'confirmed' if observed_resting else 'not confirmed'}"
-                )
+                observed_resting = await _observe_resting_order(gw, order_id, console)
         else:
             console.print(
                 "  [red]Order placement was not confirmed; quarantining the selected token.[/red]"
@@ -177,6 +171,48 @@ def _test_quote(meta: MarketMeta, best_bid: float, max_notional: float) -> Quote
     if price * size > max_notional + 1e-9:
         return None
     return Quote(meta.yes.token_id, Side.BUY, price, size)
+
+
+async def _observe_resting_order(
+    gw: ExecutionGateway,
+    order_id: str,
+    console: Console,
+) -> bool:
+    """Wait for an authoritative LIVE state across eventually-consistent reads."""
+    terminal_states = {OrderState.CANCELED, OrderState.REJECTED, OrderState.DONE}
+    get_order = getattr(gw, "get_order", None)
+    last_error: Exception | None = None
+
+    for delay in _READBACK_DELAYS_S:
+        await asyncio.sleep(delay)
+        if get_order is not None:
+            try:
+                order = await get_order(order_id)
+                if order is not None:
+                    if order.state in (OrderState.LIVE, OrderState.PARTIALLY_FILLED):
+                        console.print(
+                            f"  [green]OK[/green] order readback confirmed ({order.state.value})"
+                        )
+                        return True
+                    if order.state in terminal_states:
+                        console.print(
+                            f"  [red]FAIL[/red] order reached terminal state {order.state.value}"
+                        )
+                        return False
+            except Exception as exc:  # noqa: BLE001 - retry ambiguous authoritative reads
+                last_error = exc
+
+        try:
+            live = await gw.open_orders()
+            if any(order.order_id == order_id for order in live):
+                console.print("  [green]OK[/green] order readback confirmed (LIVE)")
+                return True
+        except Exception as exc:  # noqa: BLE001 - retry ambiguous authoritative reads
+            last_error = exc
+
+    detail = f": {last_error}" if last_error is not None else ""
+    console.print(f"  [red]FAIL[/red] order state not confirmed after retries{detail}")
+    return False
 
 
 async def _cancel_and_confirm(

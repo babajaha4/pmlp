@@ -446,6 +446,51 @@ class ExecutionGateway:
         return self._hb_failures
 
     # ── reads ───────────────────────────────────────────────────────────
+    async def get_order(self, order_id: str) -> OpenOrder | None:
+        """Read one order, including terminal states; ``None`` means not found."""
+        if self._paper or self._client is None:
+            return None
+
+        def _get() -> OpenOrder | None:
+            raw = self._client.get_order(order_id)
+            if raw is None:
+                return None
+            if isinstance(raw, dict) and "data" in raw:
+                raw = raw["data"]
+            if not isinstance(raw, dict):
+                raise ValueError("unexpected order response shape")
+
+            status = str(raw["status"]).upper()
+            original = float(raw["original_size"])
+            matched = float(raw.get("size_matched", 0))
+            remaining = max(0.0, original - matched)
+            if status == "LIVE":
+                state = OrderState.PARTIALLY_FILLED if matched > 0 else OrderState.LIVE
+            elif status == "MATCHED":
+                state = OrderState.DONE
+            elif status in ("CANCELED", "CANCELLED", "CANCELED_MARKET_RESOLVED"):
+                state = OrderState.CANCELED
+            elif status == "INVALID":
+                state = OrderState.REJECTED
+            else:
+                raise ValueError(f"unknown order status: {status}")
+
+            return OpenOrder(
+                str(_first(raw, "id", "orderID", "order_id")),
+                str(raw["asset_id"]),
+                Side(str(raw["side"]).upper()),
+                float(raw["price"]),
+                remaining,
+                state,
+                created_ts=float(raw.get("created_at", time.time())),
+            )
+
+        try:
+            return await self._io(_get)
+        except Exception as exc:  # noqa: BLE001 - a snapshot failure is fail-closed
+            log.warning("order_read_failed", order_id=order_id, err=str(exc))
+            raise GatewayReadError(f"order {order_id} snapshot unavailable") from exc
+
     async def open_orders(self) -> list[OpenOrder]:
         if self._paper or self._client is None:
             return []

@@ -159,6 +159,123 @@ def test_livetest_rejects_market_without_legal_deep_price(meta) -> None:
 
 
 @pytest.mark.asyncio
+async def test_order_readback_retries_until_single_order_is_live(meta, monkeypatch) -> None:
+    from polymaker.livetest import _observe_resting_order
+
+    order = OpenOrder("test-order", meta.yes.token_id, Side.BUY, 0.39, 10, OrderState.LIVE)
+    sleeps: list[float] = []
+
+    class FakeGateway:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        async def get_order(self, order_id: str) -> OpenOrder | None:
+            assert order_id == "test-order"
+            self.reads += 1
+            return None if self.reads == 1 else order
+
+        async def open_orders(self) -> list[OpenOrder]:
+            return []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("polymaker.livetest.asyncio.sleep", record_sleep)
+    gateway = FakeGateway()
+
+    observed = await _observe_resting_order(gateway, "test-order", _console())
+
+    assert observed is True
+    assert gateway.reads == 2
+    assert sleeps == [0.5, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_gateway_get_order_parses_authoritative_partial_fill() -> None:
+    from polymaker.execution.gateway import ExecutionGateway
+
+    raw = {
+        "id": "test-order",
+        "status": "LIVE",
+        "owner": "owner-id",
+        "maker_address": "0x" + "1" * 40,
+        "market": "0x" + "2" * 64,
+        "asset_id": "yes-token",
+        "side": "BUY",
+        "original_size": "100",
+        "size_matched": "25",
+        "price": "0.4",
+        "outcome": "YES",
+        "expiration": "0",
+        "order_type": "GTC",
+        "associate_trades": ["trade-1"],
+        "created_at": 1_700_000_000,
+    }
+    gateway = ExecutionGateway(Config())
+    gateway._client = SimpleNamespace(get_order=lambda _order_id: raw)
+
+    order = await gateway.get_order("test-order")
+
+    assert order == OpenOrder(
+        "test-order",
+        "yes-token",
+        Side.BUY,
+        0.4,
+        75.0,
+        OrderState.PARTIALLY_FILLED,
+        created_ts=1_700_000_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_order_readback_stops_on_authoritative_terminal_state(meta, monkeypatch) -> None:
+    from polymaker.livetest import _observe_resting_order
+
+    order = OpenOrder(
+        "test-order", meta.yes.token_id, Side.BUY, 0.39, 10, OrderState.CANCELED
+    )
+    sleeps: list[float] = []
+
+    class FakeGateway:
+        async def get_order(self, _order_id: str) -> OpenOrder:
+            return order
+
+        async def open_orders(self) -> list[OpenOrder]:
+            raise AssertionError("terminal single-order state is authoritative")
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("polymaker.livetest.asyncio.sleep", record_sleep)
+
+    observed = await _observe_resting_order(FakeGateway(), "test-order", _console())
+
+    assert observed is False
+    assert sleeps == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_gateway_get_order_fails_closed_on_unknown_status() -> None:
+    from polymaker.execution.gateway import ExecutionGateway
+
+    gateway = ExecutionGateway(Config())
+    gateway._client = SimpleNamespace(
+        get_order=lambda _order_id: {
+            "id": "test-order",
+            "status": "NEW_UNDOCUMENTED_STATE",
+            "asset_id": "yes-token",
+            "side": "BUY",
+            "original_size": "100",
+            "size_matched": "0",
+            "price": "0.4",
+        }
+    )
+
+    with pytest.raises(GatewayReadError, match="snapshot unavailable"):
+        await gateway.get_order("test-order")
+
+
+@pytest.mark.asyncio
 async def test_livetest_waits_for_cancelled_placement_before_cleanup(
     tmp_path, meta, monkeypatch
 ) -> None:
