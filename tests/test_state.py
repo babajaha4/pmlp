@@ -93,6 +93,18 @@ def test_matched_is_idempotent(tmp_path):
     s.close()
 
 
+def test_confirmed_without_matched_applies_fill_once(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    cash_events: list[Fill] = []
+    processor = UserEventProcessor(store, on_fill=cash_events.append)
+    event = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.CONFIRMED, 1.0)
+    assert processor.on_trade(event, "cid") is True
+    assert processor.on_trade(event, "cid") is False
+    assert store.position("tok").size == 10
+    assert cash_events == [Fill("tok", Side.BUY, 0.5, 10, "t:o", 1.0, True)]
+    store.close()
+
+
 def test_failed_trade_reverses_fill(tmp_path):
     s = StateStore(tmp_path / "s.db")
     p = UserEventProcessor(s)
@@ -102,6 +114,19 @@ def test_failed_trade_reverses_fill(tmp_path):
     assert s.position("tok").size == 0  # rolled back
     assert s.inflight("tok") == 0
     s.close()
+
+
+def test_failed_trade_reverses_position_and_cash_callback(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    cash_events: list[Fill] = []
+    processor = UserEventProcessor(store, on_fill=cash_events.append)
+    matched = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.MATCHED, 1.0)
+    failed = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.FAILED, 2.0)
+    processor.on_trade(matched, "cid")
+    assert processor.on_trade(failed, "cid") is True
+    assert store.position("tok").size == 0
+    assert [(f.side, f.size) for f in cash_events] == [(Side.BUY, 10), (Side.SELL, 10)]
+    store.close()
 
 
 def test_order_event_upsert_and_cancel(tmp_path):

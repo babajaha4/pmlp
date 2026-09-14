@@ -331,6 +331,8 @@ class Engine:
 
     def _on_fill(self, fill: Fill) -> None:
         self.risk.note_fill(fill)
+        if fill.trade_id.endswith(":reverse"):
+            return
         cid = self._token_cid.get(fill.token_id)
         if cid is None:
             return

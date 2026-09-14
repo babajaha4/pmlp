@@ -255,3 +255,15 @@ async def test_supervisor_restarts_dead_task(tmp_path, meta):
     assert len(runs) >= 2, "dead task was not restarted"
     eng.state.close()
     eng.catalog.close()
+
+
+def test_reverse_fill_updates_cash_without_creating_markout(tmp_path, meta):
+    eng = _mk_engine(tmp_path, meta)
+
+    eng._on_fill(Fill(meta.yes.token_id, Side.SELL, 0.5, 10, "t:o:reverse", 0.0))
+    eng.est[meta.condition_id].markout.evaluate(fv_now=0.1, ts=301.0)
+
+    assert eng.risk.net_cash == 5.0
+    assert eng.est[meta.condition_id].markout.markout == 0.0
+    eng.state.close()
+    eng.catalog.close()
