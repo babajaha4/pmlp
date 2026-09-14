@@ -63,14 +63,24 @@ async def test_paper_gateway_heartbeat_and_cancel_all_noop():
     await gw.cancel_all()  # no client, must not raise
 
 
-def test_gateway_requires_wallet_for_live_connect():
+def test_gateway_requires_wallet_for_live_connect(monkeypatch):
     from polymaker.config import Secrets
 
-    # explicitly-empty secrets (don't read a real .env that may exist on disk)
-    cfg = Config(secrets=Secrets(_env_file=None))
+    # Explicit values override process credentials as well as disabling dotenv.
+    cfg = Config(secrets=Secrets(PK="", BROWSER_ADDRESS="", _env_file=None))
     gw = ExecutionGateway(cfg, paper=False)
-    with pytest.raises(RuntimeError, match="no wallet"):
-        asyncio.run(gw.connect())
+
+    async def deny_io(*_args, **_kwargs):
+        pytest.fail("missing-wallet test attempted a network connection")
+
+    monkeypatch.setattr(gw, "_io", deny_io)
+    try:
+        assert not cfg.secrets.has_wallet
+        with pytest.raises(RuntimeError, match="no wallet"):
+            asyncio.run(gw.connect())
+        assert gw._client is None
+    finally:
+        gw.close()
 
 
 @pytest.mark.asyncio

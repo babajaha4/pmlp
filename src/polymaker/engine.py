@@ -355,14 +355,24 @@ class Engine:
         try:
             epoch = self._placement_epoch
             first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
-            require_proof = not first or self.state.get_sync_value(_TRADE_SYNC_REQUIRE_PROOF) == "1"
+            onchain_proof = self._load_onchain_proof()
+            require_proof = not first or onchain_proof is not None
+            if onchain_proof is not None:
+                self._state_unknown = True
+                self._restore_onchain_exposure(onchain_proof)
             await self._sync_confirmed_trades(full_day=startup or self._state_unknown)
             revision = self.state.fill_count()
             positions = self._only_traded(await self.gateway.positions())
+            if epoch != self._placement_epoch:
+                raise GatewayReadError("state changed during authoritative snapshot")
             self._assert_snapshot_revision(revision)
+            if onchain_proof is not None:
+                self._require_onchain_snapshot(onchain_proof, positions)
             if require_proof and not self._positions_explained(positions):
                 replayed = await self._sync_confirmed_trades(full_day=True)
                 revision += replayed
+                if epoch != self._placement_epoch:
+                    raise GatewayReadError("state changed during authoritative snapshot")
                 self._assert_snapshot_revision(revision)
                 if not self._positions_explained(positions):
                     for tok in self._token_cid:
@@ -383,6 +393,8 @@ class Engine:
                 # No await between this final proof and publishing the snapshot.
                 if epoch != self._placement_epoch:
                     raise GatewayReadError("state changed during authoritative snapshot")
+                if self._load_onchain_proof() != onchain_proof:
+                    raise GatewayReadError("retained on-chain proof changed during authoritative snapshot")
                 self._assert_snapshot_revision(revision)
                 if first and (self._load_pending_trades() or any(
                     self.state.inflight(tok) for tok in self._token_cid
@@ -410,6 +422,39 @@ class Engine:
             self._state_unknown = True
             await self._cancel_managed_assets()
             raise
+
+    def _load_onchain_proof(self) -> dict[str, float] | None:
+        def unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            fields = dict(pairs)
+            if len(fields) != len(pairs):
+                raise ValueError("duplicate on-chain proof token")
+            return fields
+
+        raw = self.state.get_sync_value(_TRADE_SYNC_REQUIRE_PROOF)
+        if raw is None or raw == "0":
+            return None
+        try:
+            values = json.loads(raw, object_pairs_hook=unique_fields)
+            if not isinstance(values, dict) or not values or any(
+                tok not in self._token_cid for tok in values
+            ):
+                raise ValueError("missing or unconfigured on-chain proof")
+            return {tok: _onchain_size(size) for tok, size in values.items()}
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise GatewayReadError("invalid or missing retained on-chain proof") from exc
+
+    def _restore_onchain_exposure(self, proof: dict[str, float]) -> None:
+        for tok, size in proof.items():
+            self.state.set_position(tok, size, self.state.position(tok).avg_price)
+
+    def _require_onchain_snapshot(
+        self, proof: dict[str, float], positions: dict[str, tuple[float, float]],
+    ) -> None:
+        if not all(math.isclose(
+            positions.get(tok, (0.0, 0.0))[0], size, rel_tol=0.0, abs_tol=1e-6,
+        ) for tok, size in proof.items()):
+            self._restore_onchain_exposure(proof)
+            raise GatewayReadError("positions disagree with retained on-chain proof")
 
     def _assert_snapshot_revision(self, revision: int) -> None:
         if self.state.fill_count() != revision:
@@ -898,31 +943,55 @@ class Engine:
         authoritative (it's what the exchange settles), so we correct to it —
         but only for tokens with no in-flight trades (optimistic state is newer).
         """
-        tokens = [t for t in self._token_cid if self.state.inflight(t) == 0]
-        onchain = await self.gateway.token_balances(tokens)
-        if not onchain:
-            return
         diverged = False
         try:
-            for tok, chain_size in onchain.items():
-                if tok not in tokens or self.state.inflight(tok):
-                    continue
+            tokens = [t for t in self._token_cid if self.state.inflight(t) == 0]
+            onchain = await self.gateway.token_balances(tokens)
+            # Merge against the latest durable row after the network wait.
+            proof = self._load_onchain_proof()
+            if proof is not None:
+                self._state_unknown = True
+            if not onchain:
+                return
+            try:
+                observed = {tok: _onchain_size(size) for tok, size in onchain.items()
+                            if tok in tokens and not self.state.inflight(tok)}
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise GatewayReadError("invalid on-chain exposure snapshot") from exc
+            corrections = {}
+            for tok, chain_size in observed.items():
                 internal = self.state.position(tok).size
-                if abs(internal - chain_size) > max(1.0, 0.02 * chain_size):
-                    diverged = True
-                    self._state_unknown = True
-                    # Persist the proof requirement before correcting exposure so
-                    # a restart cannot migrate this drift into trusted holdings.
-                    self.state.set_sync_value(_TRADE_SYNC_REQUIRE_PROOF, "1")
-                    log.error("position_divergence", token=tok[:12],
-                              internal=round(internal, 2), onchain=round(chain_size, 2))
-                    self.alerter.alert(
-                        f"divergence:{tok[:8]}",
-                        f"position drift: internal {internal:.1f} vs on-chain {chain_size:.1f}",
-                        critical=True,
-                    )
-                    self.state.force_set_position(tok, chain_size, self.state.position(tok).avg_price,
-                                                  source="onchain")
+                changed_proof = proof is not None and tok in proof and not math.isclose(
+                    proof[tok], chain_size, rel_tol=0.0, abs_tol=1e-6,
+                )
+                if changed_proof or abs(internal - chain_size) > max(1.0, 0.02 * chain_size):
+                    corrections[tok] = chain_size
+            if not corrections:
+                return
+            diverged = True
+            self._state_unknown = True
+            retained = dict(proof) if proof is not None else {}
+            retained.update(corrections)
+            # One committed row holds every unresolved correction before any
+            # position write. Partial later reads never drop earlier proof.
+            self.state.set_sync_value(
+                _TRADE_SYNC_REQUIRE_PROOF, json.dumps(retained, sort_keys=True, allow_nan=False),
+            )
+            for tok, chain_size in corrections.items():
+                internal = self.state.position(tok).size
+                log.error("position_divergence", token=tok[:12],
+                          internal=round(internal, 2), onchain=round(chain_size, 2))
+                self.alerter.alert(
+                    f"divergence:{tok[:8]}",
+                    f"position drift: internal {internal:.1f} vs on-chain {chain_size:.1f}",
+                    critical=True,
+                )
+                self.state.force_set_position(tok, chain_size, self.state.position(tok).avg_price,
+                                              source="onchain")
+        except Exception:
+            diverged = True
+            self._state_unknown = True
+            raise
         finally:
             if diverged:
                 self._reconcile_now.set()
@@ -1045,6 +1114,15 @@ class Engine:
                         o.notional for o in self.state.orders_for(tok) if o.side is Side.BUY
                     )
         return cost
+
+
+def _onchain_size(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("invalid on-chain size type")
+    size = _finite_float(value)
+    if size < 0:
+        raise ValueError("negative on-chain size")
+    return size
 
 
 def _finite_float(value: float) -> float:
