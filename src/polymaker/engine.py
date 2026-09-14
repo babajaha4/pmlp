@@ -306,7 +306,7 @@ class Engine:
         for ev in events:
             pending[ev.trade_id] = min(pending.get(ev.trade_id, ev.ts), ev.ts)
         self.state.set_sync_value(_TRADE_SYNC_PENDING, json.dumps(pending, sort_keys=True))
-        settled = set()
+        settled: set[str] = set()
         for ev in events:
             if ev.status not in (TradeState.CONFIRMED, TradeState.FAILED):
                 continue
