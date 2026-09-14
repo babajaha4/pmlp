@@ -13,7 +13,7 @@ from polymaker.domain import Fill, OpenOrder, OrderState, Quote, Side, TokenMeta
 from polymaker.engine import Engine
 from polymaker.execution.gateway import ExecutionGateway, GatewayReadError
 from polymaker.merge import Merger
-from polymaker.risk.manager import RiskManager
+from polymaker.risk.manager import RiskManager, _day_key
 from polymaker.state.store import StateStore
 
 
@@ -94,6 +94,34 @@ def test_risk_state_survives_restart_and_kill(tmp_path, meta) -> None:
     assert restored.error_rate == 0.0  # one attempt is below the breaker threshold
     assert restored.global_halt() == (True, "manual_kill")
     store2.close()
+
+
+def test_risk_restart_repairs_stale_cached_cash_from_fills(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    store = StateStore(path)
+    store.apply_fill(Fill("tok", Side.BUY, 0.5, 10, "fill"))
+    store.save_risk_state(
+        _day_key(), day_start_equity=0, net_cash=0, daily_pnl=5,
+        killed=False, manual_killed=False, order_attempts=0, order_errors=0,
+    )
+    risk = RiskManager(RiskConfig(), store)
+    assert risk.net_cash == pytest.approx(-5.0)
+    store.close()
+
+
+def test_new_fill_clears_restored_daily_pnl_before_persistence(tmp_path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.save_risk_state(
+        _day_key(), day_start_equity=0, net_cash=0, daily_pnl=5,
+        killed=False, manual_killed=False, order_attempts=0, order_errors=0,
+    )
+    risk = RiskManager(RiskConfig(), store)
+    fill = Fill("tok", Side.BUY, 0.5, 10, "fill")
+    store.apply_fill(fill)
+    risk.note_fill(fill)
+    assert risk.daily_pnl == pytest.approx(0.0)
+    assert store.load_risk_state(_day_key())["daily_pnl"] == pytest.approx(0.0)
+    store.close()
 
 
 def test_daily_loss_kill_is_persisted(tmp_path, meta) -> None:

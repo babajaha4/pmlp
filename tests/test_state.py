@@ -66,6 +66,38 @@ def test_state_persists_across_restart(tmp_path):
     s2.close()
 
 
+def test_apply_fill_rejects_legacy_alias(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    old = Fill("tok", Side.BUY, 0.5, 10, "trade:1")
+    new = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")
+    assert store.apply_fill(old)
+    assert not store.apply_fill(new, aliases=("trade:1",))
+    assert store.position("tok").size == 10
+    store.close()
+
+
+def test_fill_cash_flow_includes_reversals(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    store.apply_fill(Fill("tok", Side.BUY, 0.5, 10, "buy"))
+    assert store.fill_cash_flow() == -5.0
+    store.apply_fill(Fill("tok", Side.SELL, 0.5, 10, "buy:reverse"))
+    assert store.fill_cash_flow() == 0.0
+    assert store.fill_count() == 2
+    store.close()
+
+
+def test_sync_value_persists_across_restart(tmp_path):
+    path = tmp_path / "s.db"
+    store = StateStore(path)
+    assert store.get_sync_value("last-snapshot") is None
+    store.set_sync_value("last-snapshot", "123")
+    store.close()
+
+    restored = StateStore(path)
+    assert restored.get_sync_value("last-snapshot") == "123"
+    restored.close()
+
+
 # ── UserEventProcessor ───────────────────────────────────────────────────────
 
 
@@ -109,6 +141,19 @@ def test_confirmed_without_matched_applies_fill_once(tmp_path):
     assert processor.on_trade(event, "cid") is False
     assert store.position("tok").size == 10
     assert cash_events == [Fill("tok", Side.BUY, 0.5, 10, "t:o", 1.0, True)]
+    store.close()
+
+
+def test_confirmed_trade_rejects_precanonical_legacy_fill(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    store.apply_fill(Fill("tok", Side.BUY, 0.5, 10, "trade:1"))
+    processor = UserEventProcessor(store)
+    event = TradeEvent(
+        "tok", Side.BUY, 0.5, 10, "trade:order-id",
+        TradeState.CONFIRMED, 1.0, legacy_trade_id="trade:1",
+    )
+    assert processor.on_trade(event, "cid") is False
+    assert store.position("tok").size == 10
     store.close()
 
 

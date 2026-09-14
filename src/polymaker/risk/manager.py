@@ -37,11 +37,18 @@ class RiskManager:
         previous = store.latest_risk_state() if saved is None else None
         self._baseline_pending = saved is None
         self._restored_daily_pnl = float(saved["daily_pnl"]) if saved else None
-        self._net_cash = (
+        cached_net_cash = (
             float(saved["net_cash"])
             if saved
             else float(previous["net_cash"]) if previous else 0.0
         )
+        self._net_cash = store.fill_cash_flow()
+        if abs(self._net_cash - cached_net_cash) > 1e-6:
+            log.warning(
+                "cash_ledger_reconciled",
+                cached_net_cash=cached_net_cash,
+                ledger_net_cash=self._net_cash,
+            )
         self._manual_killed = (
             bool(saved["manual_killed"])
             if saved
@@ -94,7 +101,14 @@ class RiskManager:
     # ── PnL bookkeeping ─────────────────────────────────────────────────
     def note_fill(self, fill: Fill) -> None:
         self._ensure_day()
+        self._restored_daily_pnl = None
         self._net_cash += (fill.price * fill.size) * (1 if fill.side is Side.SELL else -1)
+        self._persist()
+
+    def reconcile_cash_ledger(self) -> None:
+        """Repair cached cash from the durable fill ledger."""
+        self._net_cash = self._store.fill_cash_flow()
+        self._restored_daily_pnl = None
         self._persist()
 
     def update_mark(self, token_id: str, fv: float) -> None:

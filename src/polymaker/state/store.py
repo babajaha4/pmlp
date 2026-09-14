@@ -16,6 +16,7 @@ import contextlib
 import json
 import sqlite3
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from polymaker.domain import Fill, OpenOrder, OrderState, Position, Side
@@ -52,6 +53,11 @@ CREATE TABLE IF NOT EXISTS risk_state (
     order_attempts    INTEGER NOT NULL DEFAULT 0,
     order_errors      INTEGER NOT NULL DEFAULT 0,
     updated_ts        REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_ts REAL NOT NULL
 );
 """
 
@@ -93,15 +99,24 @@ class StateStore:
     def position(self, token_id: str) -> Position:
         return self.positions.get(token_id, Position(token_id))
 
-    def apply_fill(self, fill: Fill) -> bool:
+    def apply_fill(self, fill: Fill, *, aliases: Sequence[str] = ()) -> bool:
         """Apply a fill optimistically to inventory + avg price.
 
-        IDEMPOTENT: the SQLite fills table is the dedupe gate (trade_id is the
-        primary key). A replayed fill — WS redelivery after reconnect, a MATCHED
-        arriving again after CONFIRMED, or a replay across process restarts —
-        is detected by INSERT OR IGNORE and NOT applied twice. Returns False
-        for duplicates so callers can skip their side effects too.
+        IDEMPOTENT: the SQLite fills table is the dedupe gate. A replayed fill
+        or a fill whose legacy ID was already persisted is not applied twice.
+        Returns False for duplicates so callers can skip their side effects too.
         """
+        fill_ids = tuple(dict.fromkeys((fill.trade_id, *aliases)))
+        placeholders = ",".join("?" for _ in fill_ids)
+        duplicate = self._conn.execute(
+            f"SELECT 1 FROM fills WHERE trade_id IN ({placeholders}) LIMIT 1",
+            fill_ids,
+        ).fetchone()
+        if duplicate is not None:
+            log.warning("duplicate_fill_ignored", trade_id=fill.trade_id,
+                        token=fill.token_id[:12], side=fill.side.value, size=fill.size)
+            return False
+
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO fills(trade_id,token_id,side,price,size,is_maker,ts) VALUES(?,?,?,?,?,?,?)",
             (fill.trade_id, fill.token_id, fill.side.value, fill.price, fill.size,
@@ -138,6 +153,20 @@ class StateStore:
         return self._conn.execute(
             "SELECT 1 FROM fills WHERE trade_id=? LIMIT 1", (trade_id,)
         ).fetchone() is not None
+
+    def fill_count(self) -> int:
+        """Return the number of durable fill records."""
+        row = self._conn.execute("SELECT COUNT(*) AS count FROM fills").fetchone()
+        return int(row["count"])
+
+    def fill_cash_flow(self) -> float:
+        """Return net cash derived from the durable fill ledger."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM("
+            "CASE WHEN side='BUY' THEN -(price * size) ELSE price * size END"
+            "), 0) AS net_cash FROM fills"
+        ).fetchone()
+        return float(row["net_cash"])
 
     def set_position(self, token_id: str, size: float, avg_price: float) -> None:
         pos = Position(token_id, max(0.0, size), avg_price if size > 0 else 0.0)
@@ -282,6 +311,20 @@ class StateStore:
             "order_attempts,order_errors,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)",
             (day_key, day_start_equity, net_cash, daily_pnl, int(killed), int(manual_killed),
              order_attempts, order_errors, time.time()),
+        )
+        self._conn.commit()
+
+    # ── synchronization state ──────────────────────────────────────────
+    def get_sync_value(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM sync_state WHERE key=?", (key,)
+        ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def set_sync_value(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO sync_state(key,value,updated_ts) VALUES(?,?,?)",
+            (key, value, time.time()),
         )
         self._conn.commit()
 
