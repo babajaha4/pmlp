@@ -106,6 +106,8 @@ def test_risk_restart_repairs_stale_cached_cash_from_fills(tmp_path) -> None:
     )
     risk = RiskManager(RiskConfig(), store)
     assert risk.net_cash == pytest.approx(-5.0)
+    assert risk.daily_pnl == pytest.approx(0.0)
+    assert store.load_risk_state(_day_key())["daily_pnl"] == pytest.approx(0.0)
     store.close()
 
 
@@ -121,6 +123,25 @@ def test_new_fill_clears_restored_daily_pnl_before_persistence(tmp_path) -> None
     risk.note_fill(fill)
     assert risk.daily_pnl == pytest.approx(0.0)
     assert store.load_risk_state(_day_key())["daily_pnl"] == pytest.approx(0.0)
+    store.close()
+
+
+def test_reconcile_cash_ledger_uses_the_current_utc_day(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "state.db"
+    monkeypatch.setattr("polymaker.risk.manager._day_key", lambda: "2026-09-12")
+    store = StateStore(path)
+    store.save_risk_state(
+        "2026-09-12", day_start_equity=0, net_cash=0, daily_pnl=0,
+        killed=False, manual_killed=False, order_attempts=0, order_errors=0,
+    )
+    risk = RiskManager(RiskConfig(), store)
+    store.apply_fill(Fill("tok", Side.BUY, 0.5, 10, "fill"))
+
+    monkeypatch.setattr("polymaker.risk.manager._day_key", lambda: "2026-09-13")
+    risk.reconcile_cash_ledger()
+
+    assert store.load_risk_state("2026-09-12")["net_cash"] == pytest.approx(0.0)
+    assert store.load_risk_state("2026-09-13")["net_cash"] == pytest.approx(-5.0)
     store.close()
 
 

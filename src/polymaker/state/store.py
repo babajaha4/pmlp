@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS fills (
     trade_id  TEXT PRIMARY KEY,
     token_id  TEXT, side TEXT, price REAL, size REAL, is_maker INT, ts REAL
 );
+CREATE TABLE IF NOT EXISTS fill_identities (
+    identity      TEXT PRIMARY KEY,
+    fill_trade_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS order_log (
     order_id  TEXT PRIMARY KEY,
     token_id  TEXT, side TEXT, price REAL, size REAL, state TEXT, ts REAL
@@ -102,31 +106,61 @@ class StateStore:
     def apply_fill(self, fill: Fill, *, aliases: Sequence[str] = ()) -> bool:
         """Apply a fill optimistically to inventory + avg price.
 
-        IDEMPOTENT: the SQLite fills table is the dedupe gate. A replayed fill
-        or a fill whose legacy ID was already persisted is not applied twice.
-        Returns False for duplicates so callers can skip their side effects too.
+        IDEMPOTENT: every canonical and legacy ID claims the same durable
+        identity row. The identity claims and fill insertion share one SQLite
+        write transaction, so aliases cannot be accepted in either order.
         """
         fill_ids = tuple(dict.fromkeys((fill.trade_id, *aliases)))
         placeholders = ",".join("?" for _ in fill_ids)
-        duplicate = self._conn.execute(
-            f"SELECT 1 FROM fills WHERE trade_id IN ({placeholders}) LIMIT 1",
-            fill_ids,
-        ).fetchone()
-        if duplicate is not None:
-            log.warning("duplicate_fill_ignored", trade_id=fill.trade_id,
-                        token=fill.token_id[:12], side=fill.side.value, size=fill.size)
-            return False
+        try:
+            # Serializes claims across StateStore connections before either can
+            # observe a missing alias and insert a distinct canonical fill.
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Existing databases predate fill_identities. Claim every legacy
+            # canonical ID before evaluating new aliases without rewriting rows.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO fill_identities(identity,fill_trade_id) "
+                "SELECT trade_id,trade_id FROM fills"
+            )
+            rows = self._conn.execute(
+                f"SELECT fill_trade_id FROM fill_identities "
+                f"WHERE identity IN ({placeholders})",
+                fill_ids,
+            ).fetchall()
+            existing_fill_ids = {str(row["fill_trade_id"]) for row in rows}
+            if len(existing_fill_ids) > 1:
+                self._conn.rollback()
+                log.error(
+                    "fill_identity_conflict",
+                    trade_id=fill.trade_id,
+                    identities=fill_ids,
+                    fill_trade_ids=sorted(existing_fill_ids),
+                )
+                return False
+            if existing_fill_ids:
+                self._conn.rollback()
+                log.warning("duplicate_fill_ignored", trade_id=fill.trade_id,
+                            token=fill.token_id[:12], side=fill.side.value, size=fill.size)
+                return False
 
-        cur = self._conn.execute(
-            "INSERT OR IGNORE INTO fills(trade_id,token_id,side,price,size,is_maker,ts) VALUES(?,?,?,?,?,?,?)",
-            (fill.trade_id, fill.token_id, fill.side.value, fill.price, fill.size,
-             int(fill.is_maker), fill.ts),
-        )
-        self._conn.commit()
-        if cur.rowcount == 0:
+            self._conn.execute(
+                "INSERT INTO fills(trade_id,token_id,side,price,size,is_maker,ts) VALUES(?,?,?,?,?,?,?)",
+                (fill.trade_id, fill.token_id, fill.side.value, fill.price, fill.size,
+                 int(fill.is_maker), fill.ts),
+            )
+            self._conn.executemany(
+                "INSERT INTO fill_identities(identity,fill_trade_id) VALUES(?,?)",
+                ((identity, fill.trade_id) for identity in fill_ids),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
             log.warning("duplicate_fill_ignored", trade_id=fill.trade_id,
                         token=fill.token_id[:12], side=fill.side.value, size=fill.size)
             return False
+        except BaseException:
+            self._conn.rollback()
+            raise
 
         pos = self.positions.setdefault(fill.token_id, Position(fill.token_id))
         signed = fill.size if fill.side is Side.BUY else -fill.size

@@ -44,6 +44,7 @@ class RiskManager:
         )
         self._net_cash = store.fill_cash_flow()
         if abs(self._net_cash - cached_net_cash) > 1e-6:
+            self._restored_daily_pnl = None
             log.warning(
                 "cash_ledger_reconciled",
                 cached_net_cash=cached_net_cash,
@@ -107,6 +108,7 @@ class RiskManager:
 
     def reconcile_cash_ledger(self) -> None:
         """Repair cached cash from the durable fill ledger."""
+        self._ensure_day()
         self._net_cash = self._store.fill_cash_flow()
         self._restored_daily_pnl = None
         self._persist()

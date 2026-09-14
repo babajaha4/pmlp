@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 from polymaker.domain import (
     Fill,
     OpenOrder,
@@ -72,6 +75,47 @@ def test_apply_fill_rejects_legacy_alias(tmp_path):
     new = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")
     assert store.apply_fill(old)
     assert not store.apply_fill(new, aliases=("trade:1",))
+    assert store.position("tok").size == 10
+    store.close()
+
+
+def test_apply_fill_rejects_legacy_id_after_canonical_claim(tmp_path):
+    store = StateStore(tmp_path / "s.db")
+    canonical = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")
+    legacy = Fill("tok", Side.BUY, 0.5, 10, "trade:1")
+    assert store.apply_fill(canonical, aliases=("trade:1",))
+    assert not store.apply_fill(legacy)
+    assert store.position("tok").size == 10
+    assert store.fill_count() == 1
+    store.close()
+
+
+def test_apply_fill_claims_aliases_atomically_across_connections(tmp_path):
+    path = tmp_path / "s.db"
+    bootstrap = StateStore(path)
+    bootstrap.close()
+    barrier = Barrier(2)
+
+    def apply(fill: Fill, aliases: tuple[str, ...]) -> bool:
+        store = StateStore(path)
+        barrier.wait()
+        try:
+            return store.apply_fill(fill, aliases=aliases)
+        finally:
+            store.close()
+
+    canonical = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")
+    legacy = Fill("tok", Side.BUY, 0.5, 10, "trade:1")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(
+            lambda request: apply(*request),
+            ((canonical, ("trade:1",)), (legacy, ("trade:order-id",))),
+        ))
+
+    assert sorted(outcomes) == [False, True]
+    store = StateStore(path)
+    assert store.fill_count() == 1
+    assert store.fill_cash_flow() == -5.0
     assert store.position("tok").size == 10
     store.close()
 
