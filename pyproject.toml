@@ -67,7 +67,7 @@ warn_return_any = true
 disallow_untyped_defs = true
 # third-party libs without stubs
 [[tool.mypy.overrides]]
-module = ["py_clob_client_v2.*", "sortedcontainers.*", "web3.*", "eth_account.*", "py_builder_relayer_client.*", "py_builder_signing_sdk.*"]
+module = ["py_clob_client_v2.*", "sortedcontainers.*", "web3.*", "eth_account.*", "py_builder_relayer_client.*", "py_builder_signing_sdk.*", "uvloop"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

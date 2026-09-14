@@ -219,7 +219,7 @@ def run(
     configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper_mode else "live.jsonl"))
     if cfg.engine.loop == "uvloop":
         try:
-            import uvloop  # type: ignore[import-not-found]
+            import uvloop
 
             uvloop.install()
         except Exception:  # noqa: BLE001
