@@ -153,7 +153,9 @@ def test_duplicate_reverse_clears_lifecycle_without_callbacks(tmp_path):
 
 def test_failed_retries_reverse_when_insert_does_not_persist(tmp_path):
     store = StateStore(tmp_path / "s.db")
-    processor = UserEventProcessor(store)
+    cash_events: list[Fill] = []
+    changes: list[str] = []
+    processor = UserEventProcessor(store, on_change=changes.append, on_fill=cash_events.append)
     matched = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.MATCHED, 1.0)
     failed = TradeEvent("tok", Side.BUY, 0.5, 10, "t:o", TradeState.FAILED, 2.0)
     assert processor.on_trade(matched, "cid") is True
@@ -166,11 +168,18 @@ def test_failed_retries_reverse_when_insert_does_not_persist(tmp_path):
     assert processor.on_trade(failed, "cid") is False
     assert store.inflight("tok") == 1
     assert store.position("tok").size == 10
+    assert cash_events == [Fill("tok", Side.BUY, 0.5, 10, "t:o", 1.0, True)]
+    assert changes == ["cid"]
 
     store.apply_fill = original_apply_fill  # type: ignore[method-assign]
     assert processor.on_trade(failed, "cid") is True
     assert store.inflight("tok") == 0
     assert store.position("tok").size == 0
+    assert cash_events == [
+        Fill("tok", Side.BUY, 0.5, 10, "t:o", 1.0, True),
+        Fill("tok", Side.SELL, 0.5, 10, "t:o:reverse", 1.0, True),
+    ]
+    assert changes == ["cid", "cid"]
     store.close()
 
 
