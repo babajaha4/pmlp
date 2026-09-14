@@ -471,6 +471,7 @@ cython_debug/
 
 # polymaker v2
 .venv/
+.worktrees/
 state.db
 state.paper.db
 state.db-*
