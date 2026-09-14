@@ -9,10 +9,79 @@ from polymaker.domain import Side, TradeState
 from polymaker.userstream.parse import normalize_order, normalize_trade
 
 OUR = "0xMyWallet"
+SIGNER = "0x2f7636673e12c577c681B6fE112a93216d9627eB"
+FUNDER = "0x5A5eD20745ce1c9bBd7E6595Fb6af3ac06C1D6Bc"
 
 
 def _other(token: str) -> str | None:
     return {"yes-tok": "no-tok", "no-tok": "yes-tok"}.get(token)
+
+
+def _production_trade_payload(*, status: str = "MATCHED") -> dict[str, object]:
+    return {
+        "event_type": "trade",
+        "market": "0xcond",
+        "asset_id": "no-tok",
+        "side": "SELL",
+        "outcome": "No",
+        "status": status,
+        "id": "trade-prod",
+        "timestamp": "1700000000000",
+        "maker_orders": [
+            {
+                "maker_address": "0xSomeoneElse",
+                "order_id": "order-other-1",
+                "asset_id": "no-tok",
+                "side": "BUY",
+                "matched_amount": "25",
+                "price": "0.456",
+                "outcome": "No",
+            },
+            {
+                "maker_address": FUNDER,
+                "order_id": "order-ours",
+                "asset_id": "yes-tok",
+                "side": "BUY",
+                "matched_amount": "50",
+                "price": "0.123",
+                "outcome": "No",
+            },
+            {
+                "maker_address": "0xSomeoneElseToo",
+                "order_id": "order-other-2",
+                "asset_id": "no-tok",
+                "side": "SELL",
+                "matched_amount": "10",
+                "price": "0.789",
+                "outcome": "No",
+            },
+        ],
+    }
+
+
+def test_signature_type_3_matches_funder_maker_leg():
+    events = normalize_trade(_production_trade_payload(status="CONFIRMED"), FUNDER, _other)
+
+    assert len(events) == 1
+    assert events[0].token_id == "yes-tok"
+    assert events[0].our_side is Side.BUY
+    assert events[0].price == 0.123
+    assert events[0].size == 50
+    assert events[0].trade_id == "trade-prod:order-ours"
+    assert events[0].legacy_trade_id == "trade-prod:1"
+
+
+def test_signature_type_3_does_not_match_signer():
+    assert normalize_trade(_production_trade_payload(), SIGNER, _other) == []
+
+
+def test_ws_and_rest_payloads_generate_same_fill_id():
+    ws = _production_trade_payload(status="MATCHED")
+    rest = _production_trade_payload(status="CONFIRMED")
+
+    assert normalize_trade(ws, FUNDER, _other)[0].trade_id == (
+        normalize_trade(rest, FUNDER, _other)[0].trade_id
+    )
 
 
 def test_maker_same_outcome_is_a_sell():

@@ -26,7 +26,7 @@ class UserStream:
     def __init__(
         self,
         creds: Any,
-        our_address: str,
+        maker_address: str,
         processor: UserEventProcessor,
         *,
         other_token: Callable[[str], str | None],
@@ -37,7 +37,7 @@ class UserStream:
         on_reconnect: Callable[[], None] | None = None,
     ) -> None:
         self._creds = creds
-        self._address = our_address
+        self._maker_address = maker_address
         self._proc = processor
         self._other_token = other_token
         self._condition_of_token = condition_of_token
@@ -120,7 +120,7 @@ class UserStream:
 
     def _on_trade(self, msg: dict[str, Any]) -> None:
         self._journal_write("user_trade", msg)
-        for ev in normalize_trade(msg, self._address, self._other_token):
+        for ev in normalize_trade(msg, self._maker_address, self._other_token):
             cond = self._condition_of_token(ev.token_id) or str(msg.get("market", ""))
             self._proc.on_trade(ev, cond)
 

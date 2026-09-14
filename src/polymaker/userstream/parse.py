@@ -39,7 +39,7 @@ def _ts(msg: dict[str, Any]) -> float:
 
 def normalize_trade(
     msg: dict[str, Any],
-    our_address: str,
+    maker_address: str,
     other_token: Callable[[str], str | None],
 ) -> list[TradeEvent]:
     """Extract our maker fills from a `trade` event. Returns one TradeEvent per
@@ -52,7 +52,7 @@ def normalize_trade(
     taker_outcome = msg.get("outcome")
     ts = _ts(msg)
     trade_id = str(msg.get("id", ""))
-    addr = our_address.lower()
+    addr = maker_address.lower()
 
     out: list[TradeEvent] = []
     for i, mo in enumerate(msg.get("maker_orders", []) or []):
@@ -65,7 +65,15 @@ def normalize_trade(
             continue
         if size <= 0:
             continue
-        if mo.get("outcome") == taker_outcome:
+        legacy_id = f"{trade_id}:{i}" if len(msg.get("maker_orders", [])) > 1 else trade_id
+        maker_order_id = str(mo.get("order_id", ""))
+        canonical_id = f"{trade_id}:{maker_order_id}" if maker_order_id else legacy_id
+        maker_asset = str(mo.get("asset_id", ""))
+        maker_side = mo.get("side")
+        if maker_asset and maker_side is not None:
+            token = maker_asset
+            our_side = _side(maker_side)
+        elif mo.get("outcome") == taker_outcome:
             token = taker_asset
             our_side = taker_side.opposite
         else:
@@ -77,9 +85,10 @@ def normalize_trade(
                 our_side=our_side,
                 price=price,
                 size=size,
-                trade_id=f"{trade_id}:{i}" if len(msg.get('maker_orders', [])) > 1 else trade_id,
+                trade_id=canonical_id,
                 status=status,
                 ts=ts,
+                legacy_trade_id=legacy_id,
             )
         )
     return out

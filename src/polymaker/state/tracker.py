@@ -32,6 +32,7 @@ class TradeEvent:
     trade_id: str
     status: TradeState
     ts: float
+    legacy_trade_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
