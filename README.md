@@ -116,6 +116,36 @@ thread pool so the hot path never stalls. State (positions, orders, PnL, catalog
 lives in one SQLite file; raw WS/order events are journaled to `journal/` for
 replay.
 
+### Authoritative fill ledger and recovery
+
+For signature type 3, the maker identity in a trade is the configured funder
+(the Polymarket Deposit Wallet), not the signing EOA. Authenticated CLOB trade
+history repairs confirmed fills missed by the user WebSocket. WebSocket and REST
+observations share a persistent fill identity, so replaying the same maker leg
+does not apply its position or cash movement twice.
+
+Durable fills are the authority for strategy cash: a BUY contributes
+`-(price * size)` and a SELL contributes `+(price * size)`. Daily PnL is the
+mark-to-market change in strategy equity from the UTC day-start baseline, where
+strategy equity is cumulative fill cash flow plus marked configured inventory.
+Position snapshots are authoritative for exposure, but they never invent cash.
+
+Startup and periodic authoritative reconciliation always read in this order:
+
+```text
+authenticated confirmed trades -> positions -> managed open orders
+```
+
+Incremental trade reads overlap the last successful checkpoint by at least 300
+seconds. Observed but unresolved trades are persisted and keep their older
+replay boundary across UTC rollover and process restart. If any trade,
+position, or order read fails; pending metadata is invalid; or trades cannot
+explain the position snapshot, the engine enters `STATE_UNKNOWN`, stops placing
+orders, and cancels only orders on configured tokens. It resumes only after a
+complete authoritative trade/position/order cycle succeeds; a position mismatch
+also requires a full UTC-day trade replay to agree. Pending trades unresolved
+for more than seven days remain fail-closed and require operator review.
+
 ## Strategy
 
 Maker-only, quoting both sides of each market as USDC-collateralized bids:

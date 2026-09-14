@@ -56,6 +56,47 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
    showed +$1 while the real book was −$5. Trust the live book / on-chain, not the
    position endpoint mid-move.
 
+## Fill ledger recovery and `STATE_UNKNOWN`
+
+- **Signature type 3 identifies the maker by the Deposit Wallet.** The configured
+  funder (`BROWSER_ADDRESS`) is the maker identity; the signing EOA is not the
+  identity reported for these maker legs. For an EOA wallet, the funder falls
+  back to the signer.
+- **Confirmed authenticated trades repair WebSocket gaps.** The engine backfills
+  CLOB trade history before reading positions and managed open orders. A shared
+  persistent fill identity deduplicates a maker leg seen through both sources.
+  Only confirmed REST trades become fills; do not infer fill settlement from a
+  position change or from an assumed live REST timestamp field.
+- **Fills own cash; positions own exposure.** SQLite fills calculate cash as
+  `BUY = -(price * size)` and `SELL = +(price * size)`. Daily PnL is the UTC
+  day-start change in mark-to-market strategy equity: cumulative fill cash plus
+  marked configured inventory. A position snapshot may correct inventory for
+  exposure safety, but it must never create missing cash.
+- **Reconcile in one authority order:** authenticated trades, then positions,
+  then managed open orders. A read failure, malformed pending metadata, or a
+  trade/position mismatch sets `STATE_UNKNOWN`, prevents new placements, and
+  cancels only this engine's configured-token orders. Manual or other-strategy
+  orders on the same wallet remain out of scope.
+- **Keep delayed settlements replayable.** Normal incremental reads retain at
+  least a 300-second overlap. Once an observed trade is pending, its older replay
+  boundary is stored in SQLite across a UTC-day change and a process restart;
+  the current-day checkpoint must not discard it. If it remains unresolved for
+  more than seven days, the engine stays fail-closed and requires operator
+  review.
+- **Do not clear `STATE_UNKNOWN` by hand.** For a position disagreement, require
+  an authoritative full-UTC-day trade replay and a later position snapshot to
+  agree, followed by a successful managed-order read. For metadata or read
+  failures, repair the cause and require the next complete
+  trade/position/order cycle to succeed before quoting resumes.
+- **Require recovery evidence before a live restart.** Keep the service stopped,
+  back up the production SQLite files outside the repository, and use a one-shot
+  no-quote reconciliation probe. For the known Newsom repair, the database must
+  show one recovered fill, net cash near `-6.1500` pUSD, 50 YES shares at average
+  `0.123`, zero open orders, and no kill state. At a reference mark near `0.1225`,
+  mark-to-market PnL is about `-0.025` pUSD, not about `+6.17` pUSD. Start one
+  supervised live service only after trade, position, order, and market checks
+  all succeed.
+
 ## Getting out (exits & closing) — learned the hard way
 
 - **You can't cleanly exit a *large* position on a thin market.** This is the flip
