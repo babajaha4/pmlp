@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,8 +42,18 @@ from polymaker.strategy.estimators import (
 from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
+from polymaker.userstream.parse import normalize_trade
 
 log = get_logger("engine")
+
+_TRADE_SYNC_INITIALIZED = "confirmed_trade_sync_initialized"
+_TRADE_SYNC_TS = "confirmed_trade_sync_ts"
+_TRADE_SYNC_OVERLAP_S = 300
+
+
+def _utc_day_start_ts(now: float | None = None) -> int:
+    dt = datetime.fromtimestamp(time.time() if now is None else now, tz=UTC)
+    return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
 class Engine:
@@ -106,7 +117,7 @@ class Engine:
         # subscribe feeds
         self.md.set_markets([(cid, [m.yes.token_id, m.no.token_id]) for cid, m in self.metas.items()])
         self.user = UserStream(
-            self.gateway.creds, self.gateway.address, self.user_proc,
+            self.gateway.creds, self.gateway.funder, self.user_proc,
             other_token=self._other_token, condition_of_token=self._cid_of_token,
             journal=self.journal, proxy=self.cfg.proxy,
             on_reconnect=self._on_user_reconnect,
@@ -227,27 +238,112 @@ class Engine:
         # also contain manual orders or another strategy's orders.
         if not await self._cancel_managed_assets():
             raise GatewayReadError("managed-token cancellation could not be confirmed")
-        try:
-            leftover = await self.gateway.open_orders()
-        except GatewayReadError:
-            self._state_unknown = True
-            raise
-        managed_leftover = [o for o in leftover if o.token_id in self._token_cid]
+        self.state.drop_untracked_positions(set(self._token_cid))
+        positions_n, _ = await self._reconcile_authoritative_state(startup=True)
+        managed_leftover = [o for o in self.state.orders.values() if o.token_id in self._token_cid]
         if managed_leftover:
             self.alerter.alert("startup_orders_stuck",
                                f"{len(managed_leftover)} managed orders survived cancellation",
                                critical=True)
+            self._state_unknown = True
             raise GatewayReadError("managed orders remain after startup cancellation")
         for tok in self._token_cid:
             self.state.replace_open_orders(tok, [], grace_s=0.0)
-        # purge positions that leaked in for markets we don't trade (manual UI
-        # bets etc.) so they can't distort exposure caps or PnL
-        self.state.drop_untracked_positions(set(self._token_cid))
-        positions = self._only_traded(await self.gateway.positions())
-        self._apply_authoritative_positions(positions)
         self.risk.establish_daily_baseline()
-        log.info("startup_positions", n=len(positions))
+        log.info("startup_positions", n=positions_n)
         self._state_unknown = False
+
+    async def _sync_confirmed_trades(self, full_day: bool = False) -> int:
+        now = time.time()
+        day_start = _utc_day_start_ts(now)
+        checkpoint = self.state.get_sync_value(_TRADE_SYNC_TS)
+        first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
+        after = day_start if first or full_day or not checkpoint else max(
+            day_start, int(float(checkpoint)) - _TRADE_SYNC_OVERLAP_S
+        )
+        trades = await self.gateway.trades(after=after)
+        applied = 0
+        events = []
+        for payload in trades:
+            try:
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid payload")
+                if str(payload.get("status", "")).upper() != "CONFIRMED":
+                    continue
+                owned = [mo for mo in payload.get("maker_orders", [])
+                         if str(mo.get("maker_address", "")).lower() == self.gateway.funder.lower()]
+                for mo in owned:
+                    if not str(payload.get("id") or "").strip():
+                        raise ValueError("missing identity")
+                    price, size = float(mo["price"]), float(mo["matched_amount"])
+                    if not math.isfinite(price) or not 0 < price < 1 or not math.isfinite(size) or size <= 0:
+                        raise ValueError("invalid economics")
+                    side = mo.get("side") if mo.get("asset_id") and mo.get("side") is not None else payload.get("side")
+                    if str(side).upper() not in ("BUY", "SELL"):
+                        raise ValueError("invalid side")
+                normalized = normalize_trade(payload, self.gateway.funder, self._other_token)
+                if len(normalized) != len(owned):
+                    raise ValueError("lost owned maker leg")
+                for ev in normalized:
+                    if not ev.token_id or not math.isfinite(ev.ts) or ev.ts <= 0:
+                        raise ValueError("invalid normalized trade")
+                    if self._cid_of_token(ev.token_id):
+                        events.append(ev)
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                raise GatewayReadError("invalid confirmed trade") from exc
+        for ev in events:
+            accepted = self.user_proc.on_trade(ev, self._token_cid[ev.token_id])
+            if not accepted and not self.state.fill_identity_matches(
+                Fill(ev.token_id, ev.our_side, ev.price, ev.size, ev.trade_id, ev.ts),
+                aliases=(ev.legacy_trade_id,) if ev.legacy_trade_id else (),
+            ):
+                raise GatewayReadError("confirmed trade identity conflict")
+            applied += int(accepted)
+        self.state.set_sync_value(_TRADE_SYNC_TS, str(int(now)))
+        return applied
+
+    async def _reconcile_authoritative_state(self, *, startup: bool = False) -> tuple[int, int]:
+        first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
+        try:
+            await self._sync_confirmed_trades(full_day=startup or self._state_unknown)
+            positions = self._only_traded(await self.gateway.positions())
+            if not first and not self._positions_explained(positions):
+                await self._sync_confirmed_trades(full_day=True)
+                if not self._positions_explained(positions):
+                    for tok in self._token_cid:
+                        self.state.set_position(tok, *positions.get(tok, (0.0, 0.0)))
+                    raise GatewayReadError("confirmed trades do not explain positions")
+            live = await self.gateway.open_orders()
+            ledger = self.state.fill_position_sizes()
+            for cid, meta in self.metas.items():
+                async with self._locks[cid]:
+                    for tok in (meta.yes.token_id, meta.no.token_id):
+                        if first or self.state.inflight(tok) == 0:
+                            self.state.set_position(tok, *positions.get(tok, (0.0, 0.0)))
+                            self.state.replace_open_orders(tok, [o for o in live if o.token_id == tok])
+                        if first:
+                            self.state.set_sync_value(
+                                f"confirmed_trade_baseline:{tok}",
+                                str(positions.get(tok, (0.0, 0.0))[0] - ledger.get(tok, 0.0)),
+                            )
+            self.risk.reconcile_cash_ledger()
+            self.state.set_sync_value(_TRADE_SYNC_INITIALIZED, "1")
+            self._state_unknown = False
+            return len(positions), len(live)
+        except GatewayReadError:
+            self._state_unknown = True
+            raise
+
+    def _positions_explained(self, positions: dict[str, tuple[float, float]]) -> bool:
+        ledger = self.state.fill_position_sizes()
+        return all(
+            math.isclose(
+                max(0.0, ledger.get(tok, 0.0) + float(self.state.get_sync_value(
+                    f"confirmed_trade_baseline:{tok}"
+                ) or "0")),
+                positions.get(tok, (0.0, 0.0))[0], abs_tol=1e-6,
+            ) for tok in self._token_cid
+        )
 
     async def _cancel_managed_assets(self) -> bool:
         """Cancel only orders on tokens owned by this engine instance."""
@@ -646,31 +742,16 @@ class Engine:
                     self.alerter.alert("inflight_expired",
                                        f"{len(expired)} stuck in-flight guards cleared")
 
-                positions = self._only_traded(await self.gateway.positions())
-                self._apply_authoritative_positions(positions)
-                live = await self.gateway.open_orders()
-                by_token: dict[str, list[Any]] = {}
-                for o in live:
-                    by_token.setdefault(o.token_id, []).append(o)
-                # iterate ALL our tokens, not just those in the REST response — a
-                # token whose orders vanished server-side must be cleaned up too.
-                # Hold the market lock so we don't race the quoter mid-flight.
-                for cid, meta in self.metas.items():
-                    lock = self._locks.get(cid)
-                    if lock is None:
-                        continue
-                    async with lock:
-                        for tok in (meta.yes.token_id, meta.no.token_id):
-                            if self.state.inflight(tok) == 0:
-                                self.state.replace_open_orders(tok, by_token.get(tok, []))
+                positions_n, orders_n = await self._reconcile_authoritative_state()
                 if forced:
-                    log.info("forced_reconcile_done", positions=len(positions),
-                             open_orders=len(live))
+                    log.info("forced_reconcile_done", positions=positions_n,
+                             open_orders=orders_n)
                     self._wake_all()
                 self._state_unknown = False
                 read_failure_streak = 0
             except GatewayReadError as exc:
                 self._state_unknown = True
+                await self._cancel_managed_assets()
                 read_failure_streak += 1
                 self.alerter.alert("state_unknown", str(exc), critical=True)
                 log.critical("state_unknown", err=str(exc))

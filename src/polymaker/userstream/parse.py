@@ -29,7 +29,7 @@ _STATUS = {
 
 
 def _ts(msg: dict[str, Any]) -> float:
-    raw = msg.get("timestamp")
+    raw = msg.get("timestamp", msg.get("match_time"))
     try:
         v = float(raw)  # type: ignore[arg-type]
         return v / 1000.0 if v > 1e12 else v

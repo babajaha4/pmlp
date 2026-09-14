@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sqlite3
 import time
 from collections.abc import Sequence
@@ -201,6 +202,30 @@ class StateStore:
         """Return the number of durable fill records."""
         row = self._conn.execute("SELECT COUNT(*) AS count FROM fills").fetchone()
         return int(row["count"])
+
+    def fill_position_sizes(self) -> dict[str, float]:
+        """Signed inventory from durable fills, independent of REST corrections."""
+        return {str(row["token_id"]): float(row["size"]) for row in self._conn.execute(
+            "SELECT token_id, SUM(CASE WHEN side='BUY' THEN size ELSE -size END) "
+            "AS size FROM fills GROUP BY token_id"
+        )}
+
+    def fill_identity_matches(self, fill: Fill, *, aliases: Sequence[str] = ()) -> bool:
+        """A duplicate is safe only when all claimed IDs identify one equal fill."""
+        identities = tuple(dict.fromkeys((fill.trade_id, *aliases)))
+        placeholders = ",".join("?" for _ in identities)
+        rows = self._conn.execute(
+            f"SELECT DISTINCT f.trade_id, f.token_id, f.side, f.price, f.size FROM fills f "
+            f"LEFT JOIN fill_identities i ON i.fill_trade_id=f.trade_id "
+            f"WHERE i.identity IN ({placeholders}) OR f.trade_id IN ({placeholders})",
+            (*identities, *identities),
+        ).fetchall()
+        if len(rows) != 1:
+            return False
+        row = rows[0]
+        return (row["token_id"] == fill.token_id and row["side"] == fill.side.value
+                and math.isclose(float(row["price"]), fill.price, abs_tol=1e-9)
+                and math.isclose(float(row["size"]), fill.size, abs_tol=1e-9))
 
     def fill_cash_flow(self) -> float:
         """Return net cash derived from the durable fill ledger."""

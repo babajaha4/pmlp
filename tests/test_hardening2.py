@@ -6,12 +6,272 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import AsyncMock
+
+import pytest
 
 from polymaker.domain import Fill, Position, Regime, Side
+from polymaker.execution.gateway import GatewayReadError
 from polymaker.state.store import StateStore
 from polymaker.strategy.quoting import QuoteInputs, construct_quotes
+from polymaker.userstream.parse import normalize_trade
 from tests.conftest import view
 from tests.test_engine import _engine_with_market, _feed_book
+from tests.test_userstream_parse import FUNDER, _production_trade_payload
+
+
+def _confirmed_trade(meta):
+    payload = _production_trade_payload(status="CONFIRMED")
+    payload["timestamp"] = time.time()
+    payload["asset_id"] = meta.no.token_id
+    payload["maker_orders"] = [mo for mo in payload["maker_orders"]
+                               if mo["maker_address"] == FUNDER]
+    payload["maker_orders"][0]["asset_id"] = meta.yes.token_id
+    return payload
+
+
+async def test_first_trade_sync_repairs_rest_position_without_cash(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_position(meta.yes.token_id, 50, 0.123)
+    eng.gateway._funder = FUNDER
+    eng.gateway.trades = AsyncMock(return_value=[_confirmed_trade(meta)])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (50, 0.123)})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    await eng._reconcile_authoritative_state(startup=True)
+    assert eng.state.position(meta.yes.token_id).size == 50
+    assert eng.state.fill_count() == 1
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+    assert eng.state.get_sync_value("confirmed_trade_sync_initialized") == "1"
+
+
+async def test_initialized_position_mismatch_remains_state_unknown(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (50, 0.123)})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    for _ in range(2):
+        with pytest.raises(GatewayReadError, match="do not explain positions"):
+            await eng._reconcile_authoritative_state()
+        assert eng._state_unknown
+        assert eng.state.position(meta.yes.token_id).size == 50
+    eng.state.close()
+    eng.catalog.close()
+    restarted = _engine_with_market(tmp_path, meta)
+    restarted.gateway.trades = AsyncMock(return_value=[])
+    restarted.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (50, 0.123)})
+    restarted.gateway.open_orders = AsyncMock(return_value=[])
+    with pytest.raises(GatewayReadError, match="do not explain positions"):
+        await restarted._reconcile_authoritative_state(startup=True)
+
+
+def test_ledger_inventory_and_identity_economics(tmp_path):
+    store = StateStore(tmp_path / "ledger.db")
+    fill = Fill("token", Side.BUY, 0.2, 10, "canonical", 123)
+    store.apply_fill(fill, aliases=("legacy",))
+    store.apply_fill(Fill("token", Side.SELL, 0.3, 4, "sell", 124))
+    assert store.fill_position_sizes() == {"token": 6.0}
+    assert store.fill_identity_matches(fill, aliases=("legacy",))
+    assert not store.fill_identity_matches(Fill("token", Side.BUY, 0.4, 10, "canonical", 123))
+    assert not store.fill_identity_matches(fill, aliases=("sell",))
+    assert not store.fill_identity_matches(Fill("token", Side.BUY, 0.2, 10, "missing", 123))
+
+
+@pytest.mark.parametrize("field,value", [("price", "nan"), ("matched_amount", "bad"),
+                                         ("side", "invalid")])
+async def test_malformed_owned_trade_cannot_checkpoint(tmp_path, meta, field, value):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    payload = _confirmed_trade(meta)
+    payload["maker_orders"][0][field] = value
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    with pytest.raises(GatewayReadError, match="invalid confirmed trade"):
+        await eng._sync_confirmed_trades()
+    assert eng.state.get_sync_value("confirmed_trade_sync_ts") is None
+    assert eng.state.fill_count() == 0
+
+
+async def test_rest_identity_conflict_is_quarantined(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    payload = _confirmed_trade(meta)
+    ev = normalize_trade(payload, FUNDER, eng._other_token)[0]
+    eng.user_proc.on_trade(ev, meta.condition_id)
+    payload["maker_orders"][0]["price"] = "0.4"
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    with pytest.raises(GatewayReadError, match="identity conflict"):
+        await eng._sync_confirmed_trades()
+    assert eng.state.get_sync_value("confirmed_trade_sync_ts") is None
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+
+
+async def test_startup_reads_trades_positions_orders_in_order(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    reads = []
+
+    async def trades(**kwargs):
+        reads.append("trades")
+        return [_confirmed_trade(meta)]
+
+    async def positions():
+        reads.append("positions")
+        return {meta.yes.token_id: (50, 0.123)}
+
+    async def orders():
+        reads.append("orders")
+        return []
+
+    eng.gateway.trades = trades
+    eng.gateway.positions = positions
+    eng.gateway.open_orders = orders
+    await eng._startup_reconcile()
+    assert reads == ["trades", "positions", "orders"]
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+
+
+async def test_trade_read_failure_sets_state_unknown_and_places_nothing(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway.trades = AsyncMock(side_effect=GatewayReadError("trade read failed"))
+    eng.gateway.place = AsyncMock()
+    with pytest.raises(GatewayReadError, match="trade read failed"):
+        await eng._startup_reconcile()
+    assert eng._state_unknown
+    await eng._recompute(meta.condition_id)
+    eng.gateway.place.assert_not_awaited()
+
+
+async def test_periodic_sync_applies_confirmed_fill_before_positions(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.gateway.trades = AsyncMock(return_value=[_confirmed_trade(meta)])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (50, 0.123)})
+
+    async def orders():
+        eng._running = False
+        return []
+
+    eng.gateway.open_orders = orders
+    eng._reconcile_now.set()
+    await eng._reconcile_loop()
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+    assert eng.state.position(meta.yes.token_id).size == 50
+
+
+async def test_authoritative_failure_immediately_cancels_configured_assets(tmp_path, meta, monkeypatch):
+    eng = _engine_with_market(tmp_path, meta)
+    _feed_book(eng, meta)
+    await eng._recompute(meta.condition_id)
+    assert eng.state.orders
+    eng.gateway.trades = AsyncMock(side_effect=GatewayReadError("trade read failed"))
+    eng.gateway.place = AsyncMock()
+    cancelled = []
+
+    async def cancel_asset(tok):
+        assert eng._state_unknown
+        cancelled.append(tok)
+        return True
+
+    async def stop_on_backoff(delay):
+        eng._running = False
+
+    eng.gateway.cancel_asset = cancel_asset
+    monkeypatch.setattr("polymaker.engine.asyncio.sleep", stop_on_backoff)
+    eng._reconcile_now.set()
+    await eng._reconcile_loop()
+    assert set(cancelled) == {meta.yes.token_id, meta.no.token_id}
+    assert eng._state_unknown
+    eng.gateway.place.assert_not_awaited()
+
+
+async def test_rest_match_time_and_legacy_id_are_replayable(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    payload = _confirmed_trade(meta)
+    payload["match_time"] = payload.pop("timestamp")
+    payload["maker_orders"][0].pop("order_id")
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    assert await eng._sync_confirmed_trades(full_day=True) == 1
+    assert await eng._sync_confirmed_trades(full_day=True) == 0
+    assert eng.state.fill_count() == 1
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+
+
+async def test_pre_day_inventory_baseline_survives_rest_retry(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (20, 0.4)})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    await eng._reconcile_authoritative_state(startup=True)
+    eng.gateway.trades = AsyncMock(return_value=[_confirmed_trade(meta)])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (70, 0.2)})
+    await eng._reconcile_authoritative_state()
+    assert eng.state.position(meta.yes.token_id).size == 70
+    eng._state_unknown = True
+    await eng._reconcile_authoritative_state()
+    assert not eng._state_unknown
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+
+
+async def test_ws_and_rest_same_leg_is_counted_once(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    payload = _confirmed_trade(meta)
+    payload["status"] = "MATCHED"
+    eng.user_proc.on_trade(normalize_trade(payload, FUNDER, eng._other_token)[0], meta.condition_id)
+    payload["status"] = "CONFIRMED"
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    assert await eng._sync_confirmed_trades(full_day=True) == 0
+    assert eng.state.fill_count() == 1
+    assert eng.state.inflight(meta.yes.token_id) == 0
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+
+
+async def test_trade_window_overlap_is_clamped_to_utc_day(tmp_path, meta, monkeypatch):
+    eng = _engine_with_market(tmp_path, meta)
+    monkeypatch.setattr("polymaker.engine.time.time", lambda: 1700000000.0)
+    eng.gateway.trades = AsyncMock(return_value=[])
+    await eng._sync_confirmed_trades()
+    eng.gateway.trades.assert_awaited_with(after=1699920000)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    await eng._sync_confirmed_trades()
+    eng.gateway.trades.assert_awaited_with(after=1699999700)
+    eng.state.set_sync_value("confirmed_trade_sync_ts", "1699920001")
+    await eng._sync_confirmed_trades()
+    eng.gateway.trades.assert_awaited_with(after=1699920000)
+    await eng._sync_confirmed_trades(full_day=True)
+    eng.gateway.trades.assert_awaited_with(after=1699920000)
+
+
+async def test_rest_sync_only_applies_confirmed_configured_tokens(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    matched = _confirmed_trade(meta)
+    matched["id"] = "not-confirmed"
+    matched["status"] = "MATCHED"
+    untracked = _confirmed_trade(meta)
+    untracked["id"] = "manual"
+    untracked["maker_orders"][0]["asset_id"] = "manual-token"
+    eng.gateway.trades = AsyncMock(return_value=[matched, untracked, _confirmed_trade(meta)])
+    assert await eng._sync_confirmed_trades() == 1
+    assert eng.state.fill_count() == 1
+    assert eng.state.position("manual-token").size == 0
+    assert eng.risk.net_cash == pytest.approx(-6.15)
+
+
+async def test_unknown_recovery_does_not_skip_inflight_inventory_proof(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.state.mark_inflight(meta.yes.token_id)
+    eng._state_unknown = True
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (50, 0.123)})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    with pytest.raises(GatewayReadError, match="do not explain positions"):
+        await eng._reconcile_authoritative_state()
+    assert eng._state_unknown
 
 
 # ── T0-1: inflight expiry ────────────────────────────────────────────────

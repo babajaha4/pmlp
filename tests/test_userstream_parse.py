@@ -71,6 +71,13 @@ def test_signature_type_3_matches_funder_maker_leg():
     assert events[0].legacy_trade_id == "trade-prod:1"
 
 
+def test_rest_match_time_uses_same_seconds_as_ws_timestamp():
+    rest = _production_trade_payload(status="CONFIRMED")
+    rest.pop("timestamp")
+    rest["match_time"] = "1700000000"
+    assert normalize_trade(rest, FUNDER, _other)[0].ts == 1700000000.0
+
+
 def test_signature_type_3_does_not_match_signer():
     assert normalize_trade(_production_trade_payload(), SIGNER, _other) == []
 
