@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -61,6 +62,26 @@ async def test_open_orders_snapshot_failure_is_not_empty(monkeypatch) -> None:
     with pytest.raises(GatewayReadError):
         await gw.open_orders()
     gw.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_trades_fails_closed_on_network_error():
+    gateway = ExecutionGateway(Config())
+    gateway._client = SimpleNamespace(
+        get_trades=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("down"))
+    )
+    with pytest.raises(GatewayReadError, match="trades snapshot unavailable"):
+        await gateway.trades(after=123)
+    gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_trades_fails_closed_on_malformed_row():
+    gateway = ExecutionGateway(Config())
+    gateway._client = SimpleNamespace(get_trades=lambda *_args, **_kwargs: [{"id": "t"}])
+    with pytest.raises(GatewayReadError, match="trades snapshot unavailable"):
+        await gateway.trades()
+    gateway.close()
 
 
 @pytest.mark.asyncio

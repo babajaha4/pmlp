@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -68,3 +69,20 @@ def test_gateway_requires_wallet_for_live_connect():
     gw = ExecutionGateway(cfg, paper=False)
     with pytest.raises(RuntimeError, match="no wallet"):
         asyncio.run(gw.connect())
+
+
+@pytest.mark.asyncio
+async def test_gateway_trades_reads_valid_snapshot():
+    row = {"id": "t", "status": "CONFIRMED", "maker_orders": []}
+    seen: dict[str, object] = {}
+
+    def get_trades(params, *, only_first_page):
+        seen["after"] = params.after
+        seen["only_first_page"] = only_first_page
+        return [row]
+
+    gateway = ExecutionGateway(Config())
+    gateway._client = SimpleNamespace(get_trades=get_trades)
+    assert await gateway.trades(after=123) == [row]
+    assert seen == {"after": 123, "only_first_page": False}
+    gateway.close()

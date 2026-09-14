@@ -533,6 +533,40 @@ class ExecutionGateway:
             log.warning("open_orders_failed", err=str(exc))
             raise GatewayReadError("open-orders snapshot unavailable") from exc
 
+    async def trades(self, *, after: int | None = None) -> list[dict[str, Any]]:
+        """Read the complete authenticated trade snapshot for reconciliation."""
+        if self._paper:
+            return []
+        if self._client is None:
+            raise GatewayReadError("trades snapshot unavailable: gateway not connected")
+
+        def _get() -> list[dict[str, Any]]:
+            from py_clob_client_v2.clob_types import TradeParams
+
+            raw = self._client.get_trades(TradeParams(after=after), only_first_page=False)
+            if not isinstance(raw, list):
+                raise ValueError("trades payload is not a list")
+
+            known_statuses = {"MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"}
+            for row in raw:
+                if not isinstance(row, dict):
+                    raise ValueError("trade row is not an object")
+                trade_id = row.get("id")
+                status = row.get("status")
+                if not isinstance(trade_id, str) or not trade_id.strip():
+                    raise ValueError("trade row has invalid identity")
+                if not isinstance(status, str) or status.upper() not in known_statuses:
+                    raise ValueError("trade row has invalid status")
+                if not isinstance(row.get("maker_orders"), list):
+                    raise ValueError("trade maker_orders is not a list")
+            return raw
+
+        try:
+            return await self._io(_get)
+        except Exception as exc:  # noqa: BLE001 - trade history is reconciliation-critical
+            log.warning("trades_snapshot_failed", err=str(exc))
+            raise GatewayReadError("trades snapshot unavailable") from exc
+
     async def positions(self) -> dict[str, tuple[float, float]]:
         """{token_id: (size, avg_price)} from the data API (reconcile use).
 
