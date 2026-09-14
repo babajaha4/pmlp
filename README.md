@@ -122,7 +122,9 @@ For signature type 3, the maker identity in a trade is the configured funder
 (the Polymarket Deposit Wallet), not the signing EOA. Authenticated CLOB trade
 history repairs confirmed fills missed by the user WebSocket. WebSocket and REST
 observations share a persistent fill identity, so replaying the same maker leg
-does not apply its position or cash movement twice.
+does not apply its position or cash movement twice. Live wallet configuration
+requires both `PK` and `BROWSER_ADDRESS`; for an EOA wallet, set
+`BROWSER_ADDRESS` explicitly to the signer address.
 
 Durable fills are the authority for strategy cash: a BUY contributes
 `-(price * size)` and a SELL contributes `+(price * size)`. Daily PnL is the
@@ -136,15 +138,22 @@ Startup and periodic authoritative reconciliation always read in this order:
 authenticated confirmed trades -> positions -> managed open orders
 ```
 
-Incremental trade reads overlap the last successful checkpoint by at least 300
-seconds. Observed but unresolved trades are persisted and keep their older
-replay boundary across UTC rollover and process restart. If any trade,
-position, or order read fails; pending metadata is invalid; or trades cannot
-explain the position snapshot, the engine enters `STATE_UNKNOWN`, stops placing
-orders, and cancels only orders on configured tokens. It resumes only after a
-complete authoritative trade/position/order cycle succeeds; a position mismatch
-also requires a full UTC-day trade replay to agree. Pending trades unresolved
-for more than seven days remain fail-closed and require operator review.
+Ordinary incremental trade reads start at the later of the current UTC-day
+boundary and the last successful checkpoint minus 300 seconds, so the overlap
+can be shorter near UTC rollover. Separately, every observed but unresolved
+trade identity is persisted. Its recovery query reaches back to the identity's
+earliest observed timestamp minus 300 seconds across UTC rollover and process
+restart.
+
+If any trade, position, or order read fails; pending metadata is invalid; or
+trades cannot explain the position snapshot, the engine enters `STATE_UNKNOWN`,
+stops placing orders, and cancels every wallet order on configured tokens. Only
+orders on unconfigured tokens are preserved; a manual or other-strategy order
+sharing a configured token can also be cancelled. The engine resumes only after
+a complete authoritative trade/position/order cycle succeeds; a position
+mismatch also requires a full UTC-day trade replay to agree. Pending trades
+unresolved for more than seven days remain fail-closed and require operator
+review.
 
 ## Strategy
 

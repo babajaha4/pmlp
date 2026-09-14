@@ -60,8 +60,9 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
 
 - **Signature type 3 identifies the maker by the Deposit Wallet.** The configured
   funder (`BROWSER_ADDRESS`) is the maker identity; the signing EOA is not the
-  identity reported for these maker legs. For an EOA wallet, the funder falls
-  back to the signer.
+  identity reported for these maker legs. Live setup requires both `PK` and
+  `BROWSER_ADDRESS`. For an EOA wallet, explicitly set `BROWSER_ADDRESS` to the
+  signer address.
 - **Confirmed authenticated trades repair WebSocket gaps.** The engine backfills
   CLOB trade history before reading positions and managed open orders. A shared
   persistent fill identity deduplicates a maker leg seen through both sources.
@@ -75,14 +76,17 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
 - **Reconcile in one authority order:** authenticated trades, then positions,
   then managed open orders. A read failure, malformed pending metadata, or a
   trade/position mismatch sets `STATE_UNKNOWN`, prevents new placements, and
-  cancels only this engine's configured-token orders. Manual or other-strategy
-  orders on the same wallet remain out of scope.
-- **Keep delayed settlements replayable.** Normal incremental reads retain at
-  least a 300-second overlap. Once an observed trade is pending, its older replay
-  boundary is stored in SQLite across a UTC-day change and a process restart;
-  the current-day checkpoint must not discard it. If it remains unresolved for
-  more than seven days, the engine stays fail-closed and requires operator
-  review.
+  cancels every wallet order on each configured token. Only orders on
+  unconfigured tokens are preserved; manual or other-strategy orders sharing a
+  configured token can also be cancelled.
+- **Keep delayed settlements replayable.** An ordinary incremental query starts
+  at `max(current UTC-day start, checkpoint - 300 seconds)`, so its overlap can
+  be shorter near UTC rollover. Separately, once an observed trade identity is
+  pending, SQLite preserves its earliest timestamp across UTC-day changes and
+  process restarts. Recovery queries extend to that timestamp minus 300 seconds,
+  rather than discarding it at the current-day boundary. If it remains
+  unresolved for more than seven days, the engine stays fail-closed and requires
+  operator review.
 - **Do not clear `STATE_UNKNOWN` by hand.** For a position disagreement, require
   an authoritative full-UTC-day trade replay and a later position snapshot to
   agree, followed by a successful managed-order read. For metadata or read
@@ -167,7 +171,7 @@ uv run polymaker moneydoctor --confirm-live  # live self-test (spends a little)
 uv run polymaker run           # paper maker (ONE instance)
 uv run polymaker run --live --confirm-live  # LIVE maker (ONE instance)
 uv run polymaker cancel-all    # pull every resting order
-uv run polymaker halt          # persist kill switch; scoped to configured tokens
+uv run polymaker halt          # kill + cancel all wallet orders on configured tokens
 uv run polymaker resume --confirm
 uv run polymaker backtest journal/paper.jsonl  # offline L2 replay; no wallet calls
 ```
