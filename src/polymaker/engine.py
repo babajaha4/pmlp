@@ -328,7 +328,8 @@ class Engine:
 
     def _load_pending_trades(self) -> dict[str, float]:
         try:
-            pending = json.loads(self.state.get_sync_value(_TRADE_SYNC_PENDING) or "{}")
+            raw = self.state.get_sync_value(_TRADE_SYNC_PENDING)
+            pending = json.loads("{}" if raw is None else raw)
             if not isinstance(pending, dict) or any(
                 not identity.strip() or type(ts) not in (int, float)
                 or not math.isfinite(ts) or ts <= 0 for identity, ts in pending.items()

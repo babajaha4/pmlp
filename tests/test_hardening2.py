@@ -432,7 +432,7 @@ async def test_pending_recovery_cap_keeps_metadata_and_fails_closed(tmp_path, me
     assert eng.state.get_sync_value("confirmed_trade_sync_ts") == "1700604800"
 
 
-@pytest.mark.parametrize("pending", ["not json", "[]", '{"leg": -1}', '{"leg": "123"}',
+@pytest.mark.parametrize("pending", ["", "not json", "[]", '{"leg": -1}', '{"leg": "123"}',
                                       '{"leg": NaN}', '{"leg": true}', '{"leg": ' + "9" * 400 + "}"])
 async def test_invalid_pending_metadata_cannot_advance_snapshot(tmp_path, meta, pending):
     eng = _engine_with_market(tmp_path, meta)
