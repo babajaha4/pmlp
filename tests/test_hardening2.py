@@ -274,6 +274,177 @@ async def test_unknown_recovery_does_not_skip_inflight_inventory_proof(tmp_path,
     assert eng._state_unknown
 
 
+@pytest.mark.parametrize("lifecycle", ["confirmed", "matched-confirmed"])
+@pytest.mark.parametrize("boundary", ["orders", "lock"])
+async def test_fill_during_snapshot_is_not_overwritten(tmp_path, meta, lifecycle, boundary):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={})
+    reached = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def orders():
+        reached.set()
+        if boundary == "orders":
+            await proceed.wait()
+        return []
+
+    eng.gateway.open_orders = orders
+    lock = eng._locks[meta.condition_id]
+    if boundary == "lock":
+        await lock.acquire()
+    task = asyncio.create_task(eng._reconcile_authoritative_state())
+    await reached.wait()
+    payload = _confirmed_trade(meta)
+    if lifecycle == "matched-confirmed":
+        payload["status"] = "MATCHED"
+        eng.user_proc.on_trade(normalize_trade(payload, FUNDER, eng._other_token)[0], meta.condition_id)
+    payload["status"] = "CONFIRMED"
+    eng.user_proc.on_trade(normalize_trade(payload, FUNDER, eng._other_token)[0], meta.condition_id)
+    proceed.set()
+    if boundary == "lock":
+        lock.release()
+    with pytest.raises(GatewayReadError, match="ledger changed"):
+        await task
+    assert eng.state.position(meta.yes.token_id).size == 50
+    assert eng.state.fill_position_sizes()[meta.yes.token_id] == 50
+    assert eng._state_unknown
+
+
+async def test_negative_signed_inventory_cannot_be_proven_by_zero_rest(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.state.apply_fill(Fill(meta.yes.token_id, Side.SELL, 0.3, 50, "unexplained-sell"))
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    with pytest.raises(GatewayReadError, match="do not explain positions"):
+        await eng._reconcile_authoritative_state()
+    assert eng._state_unknown
+    assert eng.state.position(meta.yes.token_id).size == 0
+    assert eng.state.fill_position_sizes()[meta.yes.token_id] == -50
+
+
+@pytest.mark.parametrize("recovery", ["overlap", "restart", "utc-rollover"])
+async def test_pending_net_flat_roundtrip_stays_in_replay_window(tmp_path, meta, monkeypatch, recovery):
+    clock = [1700000000.0]
+    monkeypatch.setattr("polymaker.engine.time.time", lambda: clock[0])
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    buy = _confirmed_trade(meta)
+    buy["id"] = "pending-buy"
+    buy["status"] = "MATCHED"
+    buy["maker_orders"][0].update(price="0.2", matched_amount="10")
+    sell = _confirmed_trade(meta)
+    sell["id"] = "pending-sell"
+    sell["status"] = "MINED"
+    sell["maker_orders"][0].update(side="SELL", price="0.3", matched_amount="10")
+    rows = [buy, sell]
+    requested = []
+
+    async def trades(*, after):
+        requested.append(after)
+        return [row for row in rows if float(row["timestamp"]) > after]
+
+    eng.gateway.trades = trades
+    eng.gateway.positions = AsyncMock(return_value={})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    await eng._reconcile_authoritative_state()
+    clock[0] += 1000
+    await eng._reconcile_authoritative_state()
+    if recovery != "overlap":
+        eng.state.close()
+        eng.catalog.close()
+        eng = _engine_with_market(tmp_path, meta)
+        eng.gateway._funder = FUNDER
+        eng.gateway.trades = trades
+        eng.gateway.positions = AsyncMock(return_value={})
+        eng.gateway.open_orders = AsyncMock(return_value=[])
+    if recovery == "utc-rollover":
+        clock[0] = 1700093000.0
+    buy["status"] = sell["status"] = "CONFIRMED"
+    await eng._reconcile_authoritative_state()
+    assert eng.state.fill_count() == 2
+    assert eng.risk.net_cash == pytest.approx(1.0)
+    assert eng.state.position(meta.yes.token_id).size == 0
+    assert requested[-1] <= 1699999700
+    await eng._sync_confirmed_trades()
+    assert requested[-1] > 1700000000
+
+
+async def test_failed_pending_trade_is_not_released_with_unreversed_fill(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    payload = _confirmed_trade(meta)
+    payload["status"] = "MATCHED"
+    event = normalize_trade(payload, FUNDER, eng._other_token)[0]
+    eng.user_proc.on_trade(event, meta.condition_id)
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    await eng._sync_confirmed_trades()
+    eng.state.close()
+    eng.catalog.close()
+    restarted = _engine_with_market(tmp_path, meta)
+    restarted.gateway._funder = FUNDER
+    payload["status"] = "FAILED"
+    restarted.gateway.trades = AsyncMock(return_value=[payload])
+    with pytest.raises(GatewayReadError, match="durable reversal"):
+        await restarted._sync_confirmed_trades()
+
+
+def test_failure_identity_requires_equal_durable_reversal(tmp_path):
+    store = StateStore(tmp_path / "failed.db")
+    original = Fill("token", Side.BUY, 0.2, 10, "legacy", 123)
+    canonical = Fill("token", Side.BUY, 0.2, 10, "canonical", 123)
+    assert store.fill_failure_settled(canonical, aliases=("legacy",))
+    store.apply_fill(original, aliases=("canonical",))
+    assert not store.fill_failure_settled(canonical, aliases=("legacy",))
+    store.apply_fill(Fill("token", Side.SELL, 0.2, 10, "legacy:reverse", 123))
+    assert store.fill_failure_settled(canonical, aliases=("legacy",))
+    assert not store.fill_failure_settled(Fill("token", Side.BUY, 0.4, 10, "canonical", 123))
+
+
+async def test_pending_recovery_cap_keeps_metadata_and_fails_closed(tmp_path, meta, monkeypatch):
+    clock = [1700000000.0]
+    monkeypatch.setattr("polymaker.engine.time.time", lambda: clock[0])
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    payload = _confirmed_trade(meta)
+    payload["status"] = "MATCHED"
+    old_buy = _confirmed_trade(meta)
+    old_buy.update(id="older-settled-buy", timestamp=1699999900)
+    old_sell = _confirmed_trade(meta)
+    old_sell.update(id="older-settled-sell", timestamp=1699999901)
+    old_sell["maker_orders"][0]["side"] = "SELL"
+    eng.gateway.trades = AsyncMock(return_value=[old_buy, old_sell, payload])
+    await eng._sync_confirmed_trades()
+    pending = eng.state.get_sync_value("confirmed_trade_pending")
+    clock[0] += 7 * 86400
+    await eng._sync_confirmed_trades()
+    assert eng.gateway.trades.call_args.kwargs["after"] == 1699999700
+    clock[0] += 1
+    with pytest.raises(GatewayReadError, match="7-day recovery"):
+        await eng._reconcile_authoritative_state()
+    assert eng._state_unknown
+    assert eng.state.get_sync_value("confirmed_trade_pending") == pending
+    assert eng.state.get_sync_value("confirmed_trade_sync_ts") == "1700604800"
+
+
+@pytest.mark.parametrize("pending", ["not json", "[]", '{"leg": -1}', '{"leg": "123"}',
+                                      '{"leg": NaN}', '{"leg": true}', '{"leg": ' + "9" * 400 + "}"])
+async def test_invalid_pending_metadata_cannot_advance_snapshot(tmp_path, meta, pending):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_pending", pending)
+    eng.gateway.trades = AsyncMock(return_value=[])
+    with pytest.raises(GatewayReadError, match="pending trade metadata"):
+        await eng._reconcile_authoritative_state()
+    assert eng._state_unknown
+    assert eng.state.get_sync_value("confirmed_trade_sync_ts") is None
+    eng.gateway.trades.assert_not_awaited()
+
+
 # ── T0-1: inflight expiry ────────────────────────────────────────────────
 def test_inflight_expires_after_max_age(tmp_path):
     s = StateStore(tmp_path / "s.db")

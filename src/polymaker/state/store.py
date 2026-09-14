@@ -212,17 +212,35 @@ class StateStore:
 
     def fill_identity_matches(self, fill: Fill, *, aliases: Sequence[str] = ()) -> bool:
         """A duplicate is safe only when all claimed IDs identify one equal fill."""
-        identities = tuple(dict.fromkeys((fill.trade_id, *aliases)))
+        rows = self._identity_fills(fill.trade_id, aliases)
+        return len(rows) == 1 and self._fill_economics_match(rows[0], fill)
+
+    def fill_failure_settled(self, fill: Fill, *, aliases: Sequence[str] = ()) -> bool:
+        """FAILED is terminal only if no optimistic fill exists, or it was reversed."""
+        rows = self._identity_fills(fill.trade_id, aliases)
+        if not rows:
+            return True
+        if len(rows) != 1 or not self._fill_economics_match(rows[0], fill):
+            return False
+        original_id = str(rows[0]["trade_id"])
+        reversal_ids = tuple(f"{identity}:reverse" for identity in (
+            original_id, fill.trade_id, *aliases
+        ))
+        reverse = Fill(fill.token_id, fill.side.opposite, fill.price, fill.size, reversal_ids[0], fill.ts)
+        return self.fill_identity_matches(reverse, aliases=reversal_ids[1:])
+
+    def _identity_fills(self, trade_id: str, aliases: Sequence[str]) -> list[sqlite3.Row]:
+        identities = tuple(dict.fromkeys((trade_id, *aliases)))
         placeholders = ",".join("?" for _ in identities)
-        rows = self._conn.execute(
+        return self._conn.execute(
             f"SELECT DISTINCT f.trade_id, f.token_id, f.side, f.price, f.size FROM fills f "
             f"LEFT JOIN fill_identities i ON i.fill_trade_id=f.trade_id "
             f"WHERE i.identity IN ({placeholders}) OR f.trade_id IN ({placeholders})",
             (*identities, *identities),
         ).fetchall()
-        if len(rows) != 1:
-            return False
-        row = rows[0]
+
+    @staticmethod
+    def _fill_economics_match(row: sqlite3.Row, fill: Fill) -> bool:
         return (row["token_id"] == fill.token_id and row["side"] == fill.side.value
                 and math.isclose(float(row["price"]), fill.price, abs_tol=1e-9)
                 and math.isclose(float(row["size"]), fill.size, abs_tol=1e-9))

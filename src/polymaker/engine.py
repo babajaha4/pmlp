@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import math
 import time
 from datetime import UTC, datetime
@@ -22,7 +23,7 @@ from polymaker.alerts import Alerter
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
-from polymaker.domain import Fill, MarketMeta, Regime, Side
+from polymaker.domain import Fill, MarketMeta, Regime, Side, TradeState
 from polymaker.execution.gateway import ExecutionGateway, GatewayReadError
 from polymaker.execution.reconciler import reconcile
 from polymaker.journal import Journal
@@ -49,6 +50,8 @@ log = get_logger("engine")
 _TRADE_SYNC_INITIALIZED = "confirmed_trade_sync_initialized"
 _TRADE_SYNC_TS = "confirmed_trade_sync_ts"
 _TRADE_SYNC_OVERLAP_S = 300
+_TRADE_SYNC_PENDING = "confirmed_trade_pending"
+_TRADE_SYNC_PENDING_MAX_AGE_S = 7 * 86400
 
 
 def _utc_day_start_ts(now: float | None = None) -> int:
@@ -256,11 +259,16 @@ class Engine:
     async def _sync_confirmed_trades(self, full_day: bool = False) -> int:
         now = time.time()
         day_start = _utc_day_start_ts(now)
+        pending = self._load_pending_trades()
+        self._check_pending_age(pending, now)
         checkpoint = self.state.get_sync_value(_TRADE_SYNC_TS)
         first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
         after = day_start if first or full_day or not checkpoint else max(
             day_start, int(float(checkpoint)) - _TRADE_SYNC_OVERLAP_S
         )
+        if pending:
+            after = min(after, math.floor(min(pending.values())) - _TRADE_SYNC_OVERLAP_S)
+            log.warning("pending_trade_recovery_window", pending=len(pending), after=after)
         trades = await self.gateway.trades(after=after)
         applied = 0
         events = []
@@ -268,8 +276,10 @@ class Engine:
             try:
                 if not isinstance(payload, dict):
                     raise ValueError("invalid payload")
-                if str(payload.get("status", "")).upper() != "CONFIRMED":
-                    continue
+                if str(payload.get("status", "")).upper() not in (
+                    "MATCHED", "MINED", "RETRYING", "CONFIRMED", "FAILED"
+                ):
+                    raise ValueError("invalid status")
                 owned = [mo for mo in payload.get("maker_orders", [])
                          if str(mo.get("maker_address", "")).lower() == self.gateway.funder.lower()]
                 for mo in owned:
@@ -291,32 +301,73 @@ class Engine:
                         events.append(ev)
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 raise GatewayReadError("invalid confirmed trade") from exc
+        # Keep every observed identity pinned until the complete snapshot settles
+        # successfully. Crashes or processor conflicts cannot forget older legs.
         for ev in events:
+            pending[ev.trade_id] = min(pending.get(ev.trade_id, ev.ts), ev.ts)
+        self.state.set_sync_value(_TRADE_SYNC_PENDING, json.dumps(pending, sort_keys=True))
+        settled = set()
+        for ev in events:
+            if ev.status not in (TradeState.CONFIRMED, TradeState.FAILED):
+                continue
+            fill = Fill(ev.token_id, ev.our_side, ev.price, ev.size, ev.trade_id, ev.ts)
+            aliases = (ev.legacy_trade_id,) if ev.legacy_trade_id else ()
             accepted = self.user_proc.on_trade(ev, self._token_cid[ev.token_id])
-            if not accepted and not self.state.fill_identity_matches(
-                Fill(ev.token_id, ev.our_side, ev.price, ev.size, ev.trade_id, ev.ts),
-                aliases=(ev.legacy_trade_id,) if ev.legacy_trade_id else (),
-            ):
+            if ev.status is TradeState.FAILED:
+                if not self.state.fill_failure_settled(fill, aliases=aliases):
+                    raise GatewayReadError("FAILED trade lacks durable reversal")
+            elif not accepted and not self.state.fill_identity_matches(fill, aliases=aliases):
                 raise GatewayReadError("confirmed trade identity conflict")
             applied += int(accepted)
+            settled.update((ev.trade_id, *aliases))
+        remaining = {identity: ts for identity, ts in pending.items() if identity not in settled}
+        self.state.set_sync_value(_TRADE_SYNC_PENDING, json.dumps(remaining, sort_keys=True))
+        self._check_pending_age(remaining, now)
         self.state.set_sync_value(_TRADE_SYNC_TS, str(int(now)))
         return applied
+
+    def _load_pending_trades(self) -> dict[str, float]:
+        try:
+            pending = json.loads(self.state.get_sync_value(_TRADE_SYNC_PENDING) or "{}")
+            if not isinstance(pending, dict) or any(
+                not identity.strip() or type(ts) not in (int, float)
+                or not math.isfinite(ts) or ts <= 0 for identity, ts in pending.items()
+            ):
+                raise ValueError("invalid pending metadata")
+            return pending
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise GatewayReadError("invalid pending trade metadata") from exc
+
+    @staticmethod
+    def _check_pending_age(pending: dict[str, float], now: float) -> None:
+        if pending and now - min(pending.values()) > _TRADE_SYNC_PENDING_MAX_AGE_S:
+            raise GatewayReadError("unresolved trades exceed 7-day recovery window; operator review required")
 
     async def _reconcile_authoritative_state(self, *, startup: bool = False) -> tuple[int, int]:
         first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
         try:
             await self._sync_confirmed_trades(full_day=startup or self._state_unknown)
+            revision = self.state.fill_count()
             positions = self._only_traded(await self.gateway.positions())
+            self._assert_snapshot_revision(revision)
             if not first and not self._positions_explained(positions):
-                await self._sync_confirmed_trades(full_day=True)
+                replayed = await self._sync_confirmed_trades(full_day=True)
+                revision += replayed
+                self._assert_snapshot_revision(revision)
                 if not self._positions_explained(positions):
                     for tok in self._token_cid:
                         self.state.set_position(tok, *positions.get(tok, (0.0, 0.0)))
                     raise GatewayReadError("confirmed trades do not explain positions")
             live = await self.gateway.open_orders()
-            ledger = self.state.fill_position_sizes()
-            for cid, meta in self.metas.items():
-                async with self._locks[cid]:
+            async with contextlib.AsyncExitStack() as locks:
+                for cid in self.metas:
+                    await locks.enter_async_context(self._locks[cid])
+                # No await between this final proof and publishing the snapshot.
+                self._assert_snapshot_revision(revision)
+                if not first and not self._positions_explained(positions):
+                    raise GatewayReadError("confirmed trades do not explain positions")
+                ledger = self.state.fill_position_sizes()
+                for meta in self.metas.values():
                     for tok in (meta.yes.token_id, meta.no.token_id):
                         if first or self.state.inflight(tok) == 0:
                             self.state.set_position(tok, *positions.get(tok, (0.0, 0.0)))
@@ -326,21 +377,25 @@ class Engine:
                                 f"confirmed_trade_baseline:{tok}",
                                 str(positions.get(tok, (0.0, 0.0))[0] - ledger.get(tok, 0.0)),
                             )
-            self.risk.reconcile_cash_ledger()
-            self.state.set_sync_value(_TRADE_SYNC_INITIALIZED, "1")
-            self._state_unknown = False
+                self.risk.reconcile_cash_ledger()
+                self.state.set_sync_value(_TRADE_SYNC_INITIALIZED, "1")
+                self._state_unknown = False
             return len(positions), len(live)
         except GatewayReadError:
             self._state_unknown = True
             raise
 
+    def _assert_snapshot_revision(self, revision: int) -> None:
+        if self.state.fill_count() != revision:
+            raise GatewayReadError("fill ledger changed during authoritative snapshot")
+
     def _positions_explained(self, positions: dict[str, tuple[float, float]]) -> bool:
         ledger = self.state.fill_position_sizes()
         return all(
             math.isclose(
-                max(0.0, ledger.get(tok, 0.0) + float(self.state.get_sync_value(
+                ledger.get(tok, 0.0) + float(self.state.get_sync_value(
                     f"confirmed_trade_baseline:{tok}"
-                ) or "0")),
+                ) or "0"),
                 positions.get(tok, (0.0, 0.0))[0], abs_tol=1e-6,
             ) for tok in self._token_cid
         )
