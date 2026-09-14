@@ -79,6 +79,41 @@ def test_apply_fill_rejects_legacy_alias(tmp_path):
     store.close()
 
 
+def test_duplicate_alias_claim_survives_restart(tmp_path):
+    path = tmp_path / "s.db"
+    store = StateStore(path)
+    legacy = Fill("tok", Side.BUY, 0.5, 10, "trade:1")
+    canonical = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")
+    assert store.apply_fill(legacy)
+    assert not store.apply_fill(canonical, aliases=("trade:1",))
+    store.close()
+
+    restored = StateStore(path)
+    assert not restored.apply_fill(canonical)
+    assert restored.fill_count() == 1
+    assert restored.fill_cash_flow() == -5.0
+    restored.close()
+
+
+def test_alias_learning_backfill_survives_restart(tmp_path):
+    path = tmp_path / "s.db"
+    store = StateStore(path)
+    legacy = Fill("tok", Side.BUY, 0.5, 10, "trade:1")
+    canonical = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")
+    assert store.apply_fill(legacy)
+    # Simulate a pre-identity database whose fill rows have not been backfilled.
+    store._conn.execute("DELETE FROM fill_identities")  # type: ignore[attr-defined]
+    store._conn.commit()  # type: ignore[attr-defined]
+    assert not store.apply_fill(canonical, aliases=("trade:1",))
+    store.close()
+
+    restored = StateStore(path)
+    assert not restored.apply_fill(canonical)
+    assert restored.fill_count() == 1
+    assert restored.fill_cash_flow() == -5.0
+    restored.close()
+
+
 def test_apply_fill_rejects_legacy_id_after_canonical_claim(tmp_path):
     store = StateStore(tmp_path / "s.db")
     canonical = Fill("tok", Side.BUY, 0.5, 10, "trade:order-id")

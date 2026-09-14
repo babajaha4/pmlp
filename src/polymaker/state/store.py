@@ -138,7 +138,16 @@ class StateStore:
                 )
                 return False
             if existing_fill_ids:
-                self._conn.rollback()
+                owner = existing_fill_ids.pop()
+                # A duplicate may teach us a canonical/legacy spelling we did
+                # not receive with the original fill. Keep that identity bound
+                # to its sole owner so a later retry without aliases is still
+                # rejected after restart.
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO fill_identities(identity,fill_trade_id) VALUES(?,?)",
+                    ((identity, owner) for identity in fill_ids),
+                )
+                self._conn.commit()
                 log.warning("duplicate_fill_ignored", trade_id=fill.trade_id,
                             token=fill.token_id[:12], side=fill.side.value, size=fill.size)
                 return False
