@@ -51,6 +51,7 @@ _TRADE_SYNC_INITIALIZED = "confirmed_trade_sync_initialized"
 _TRADE_SYNC_TS = "confirmed_trade_sync_ts"
 _TRADE_SYNC_OVERLAP_S = 300
 _TRADE_SYNC_PENDING = "confirmed_trade_pending"
+_TRADE_SYNC_REQUIRE_PROOF = "confirmed_trade_requires_proof"
 _TRADE_SYNC_PENDING_MAX_AGE_S = 7 * 86400
 
 
@@ -78,7 +79,7 @@ class Engine:
         self.md = MarketDataService(on_dirty=self._on_dirty, on_trade=self._on_trade,
                                     journal=self.journal, proxy=cfg.proxy)
         self.user_proc = UserEventProcessor(self.state, on_change=self._wake_cid,
-                                            on_fill=self._on_fill)
+                                            on_fill=self._on_fill, before_fill=self._prepare_fill)
         self.user: UserStream | None = None
 
         # per-market state
@@ -92,6 +93,8 @@ class Engine:
         self._token_cid: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
         self._reservation_lock = asyncio.Lock()  # atomic cross-market exposure reservation
+        self._placement_lock = asyncio.Lock()  # placement completion precedes cancellation
+        self._placement_epoch = 0
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
         # supervised tasks: name -> (factory, task) so a dead task restarts
@@ -239,22 +242,26 @@ class Engine:
     async def _startup_reconcile(self) -> None:
         # Never touch orders outside the configured markets. A single wallet may
         # also contain manual orders or another strategy's orders.
-        if not await self._cancel_managed_assets():
-            raise GatewayReadError("managed-token cancellation could not be confirmed")
-        self.state.drop_untracked_positions(set(self._token_cid))
-        positions_n, _ = await self._reconcile_authoritative_state(startup=True)
-        managed_leftover = [o for o in self.state.orders.values() if o.token_id in self._token_cid]
-        if managed_leftover:
-            self.alerter.alert("startup_orders_stuck",
-                               f"{len(managed_leftover)} managed orders survived cancellation",
-                               critical=True)
+        try:
+            if not await self._cancel_managed_assets():
+                raise GatewayReadError("managed-token cancellation could not be confirmed")
+            self.state.drop_untracked_positions(set(self._token_cid))
+            positions_n, _ = await self._reconcile_authoritative_state(startup=True)
+            managed_leftover = [o for o in self.state.orders.values() if o.token_id in self._token_cid]
+            if managed_leftover:
+                self.alerter.alert("startup_orders_stuck",
+                                   f"{len(managed_leftover)} managed orders survived cancellation",
+                                   critical=True)
+                raise GatewayReadError("managed orders remain after startup cancellation")
+            for tok in self._token_cid:
+                self.state.replace_open_orders(tok, [], grace_s=0.0)
+            self.risk.establish_daily_baseline()
+            log.info("startup_positions", n=positions_n)
+            self._state_unknown = False
+        except Exception:
             self._state_unknown = True
-            raise GatewayReadError("managed orders remain after startup cancellation")
-        for tok in self._token_cid:
-            self.state.replace_open_orders(tok, [], grace_s=0.0)
-        self.risk.establish_daily_baseline()
-        log.info("startup_positions", n=positions_n)
-        self._state_unknown = False
+            await self._cancel_managed_assets()
+            raise
 
     async def _sync_confirmed_trades(self, full_day: bool = False) -> int:
         now = time.time()
@@ -299,7 +306,7 @@ class Engine:
                         raise ValueError("invalid normalized trade")
                     if self._cid_of_token(ev.token_id):
                         events.append(ev)
-            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
                 raise GatewayReadError("invalid confirmed trade") from exc
         # Keep every observed identity pinned until the complete snapshot settles
         # successfully. Crashes or processor conflicts cannot forget older legs.
@@ -345,13 +352,15 @@ class Engine:
             raise GatewayReadError("unresolved trades exceed 7-day recovery window; operator review required")
 
     async def _reconcile_authoritative_state(self, *, startup: bool = False) -> tuple[int, int]:
-        first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
         try:
+            epoch = self._placement_epoch
+            first = self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
+            require_proof = not first or self.state.get_sync_value(_TRADE_SYNC_REQUIRE_PROOF) == "1"
             await self._sync_confirmed_trades(full_day=startup or self._state_unknown)
             revision = self.state.fill_count()
             positions = self._only_traded(await self.gateway.positions())
             self._assert_snapshot_revision(revision)
-            if not first and not self._positions_explained(positions):
+            if require_proof and not self._positions_explained(positions):
                 replayed = await self._sync_confirmed_trades(full_day=True)
                 revision += replayed
                 self._assert_snapshot_revision(revision)
@@ -360,12 +369,26 @@ class Engine:
                         self.state.set_position(tok, *positions.get(tok, (0.0, 0.0)))
                     raise GatewayReadError("confirmed trades do not explain positions")
             live = await self.gateway.open_orders()
+            try:
+                for order in live:
+                    if order.token_id in self._token_cid:
+                        _finite_float(order.price)
+                        _finite_float(order.size)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise GatewayReadError("invalid open-orders snapshot") from exc
             async with contextlib.AsyncExitStack() as locks:
                 for cid in self.metas:
                     await locks.enter_async_context(self._locks[cid])
+                await locks.enter_async_context(self._placement_lock)
                 # No await between this final proof and publishing the snapshot.
+                if epoch != self._placement_epoch:
+                    raise GatewayReadError("state changed during authoritative snapshot")
                 self._assert_snapshot_revision(revision)
-                if not first and not self._positions_explained(positions):
+                if first and (self._load_pending_trades() or any(
+                    self.state.inflight(tok) for tok in self._token_cid
+                )):
+                    raise GatewayReadError("pending trades prevent ledger initialization")
+                if require_proof and not self._positions_explained(positions):
                     raise GatewayReadError("confirmed trades do not explain positions")
                 ledger = self.state.fill_position_sizes()
                 for meta in self.metas.values():
@@ -380,10 +403,12 @@ class Engine:
                             )
                 self.risk.reconcile_cash_ledger()
                 self.state.set_sync_value(_TRADE_SYNC_INITIALIZED, "1")
+                self.state.set_sync_value(_TRADE_SYNC_REQUIRE_PROOF, "0")
                 self._state_unknown = False
             return len(positions), len(live)
-        except GatewayReadError:
+        except Exception:
             self._state_unknown = True
+            await self._cancel_managed_assets()
             raise
 
     def _assert_snapshot_revision(self, revision: int) -> None:
@@ -403,11 +428,23 @@ class Engine:
 
     async def _cancel_managed_assets(self) -> bool:
         """Cancel only orders on tokens owned by this engine instance."""
+        return await self._cancel_assets([
+            token.token_id for meta in self.metas.values() for token in (meta.yes, meta.no)
+        ])
+
+    async def _cancel_assets(self, tokens: list[str]) -> bool:
+        # Invalidate waiters before waiting for an already-submitted placement.
+        # Cancellation never acquires market or reservation locks.
+        self._placement_epoch += 1
         ok = True
-        for meta in self.metas.values():
-            for tok in (meta.yes.token_id, meta.no.token_id):
+        async with self._placement_lock:
+            for tok in tokens:
                 try:
-                    ok = await self.gateway.cancel_asset(tok) and ok
+                    cancelled = await self.gateway.cancel_asset(tok)
+                    ok = cancelled and ok
+                    if cancelled:
+                        for order in self.state.orders_for(tok):
+                            self.state.remove_order(order.order_id)
                 except Exception as exc:  # noqa: BLE001
                     ok = False
                     log.critical("managed_cancel_failed", token=tok[:12], err=str(exc))
@@ -429,7 +466,13 @@ class Engine:
         """Scope account positions to tokens WE trade. Manual/UI positions in
         other markets are the operator's business — they must not enter our
         state, exposure caps, or PnL."""
-        return {t: v for t, v in positions.items() if t in self._token_cid}
+        try:
+            return {
+                t: (_finite_float(v[0]), _finite_float(v[1]))
+                for t, v in positions.items() if t in self._token_cid
+            }
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise GatewayReadError("invalid positions snapshot") from exc
 
     # ── callbacks ───────────────────────────────────────────────────────
     def _on_dirty(self, condition_id: str, token_id: str) -> None:
@@ -480,6 +523,13 @@ class Engine:
             consumed = book.depth_within(Side.BUY, bb.price - 3 * book.tick_size, bb.price)
         if consumed > 0 and tp.size >= p.event_sweep_frac * consumed:
             self._sweep[cid] = True
+
+    def _prepare_fill(self) -> None:
+        self.risk.prepare_fill()
+        if self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) == "1":
+            # A new-day restart has known pre-fill holdings. Initial migration
+            # still establishes its baseline after repairing the old snapshot.
+            self.risk.establish_daily_baseline()
 
     def _on_fill(self, fill: Fill) -> None:
         self.risk.note_fill(fill)
@@ -541,6 +591,7 @@ class Engine:
             await self._recompute_locked(cid)
 
     async def _recompute_locked(self, cid: str) -> None:
+        epoch = self._placement_epoch
         meta = self.metas[cid]
         p = self.profiles[cid]
         yes_book = self.md.book(meta.yes.token_id)
@@ -658,6 +709,8 @@ class Engine:
         placed_n = 0
         if plan.to_place:
             async with self._reservation_lock:
+                if not self._placement_allowed(cid, epoch):
+                    return
                 fitted = self.risk.fit_reservation(
                     meta, plan.to_place, event_group_cost=self._event_group_cost(meta)
                 )
@@ -683,11 +736,22 @@ class Engine:
                         log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                         self._dirty[cid].set()  # retry soon
                     else:
-                        placed = await self.gateway.place(plan.to_place, meta)
-                        placed_n = len(placed)
-                        self.risk.note_order_result(len(placed) == len(plan.to_place))
-                        for o in placed:
-                            self.state.upsert_order(o)
+                        async with self._placement_lock:
+                            if not self._placement_allowed(cid, epoch):
+                                return
+                            placed = await self.gateway.place(
+                                plan.to_place, meta,
+                                can_place=lambda: self._placement_allowed(cid, epoch),
+                            )
+                            placed_n = len(placed)
+                            for o in placed:
+                                self.state.upsert_order(o)
+                            valid = self._placement_allowed(cid, epoch)
+                            if valid:
+                                self.risk.note_order_result(len(placed) == len(plan.to_place))
+                        if not valid:
+                            await self._quarantine(meta, reason="placement_invalidated")
+                            return
                         if len(placed) < len(plan.to_place):
                             # QUARANTINE: a failed/partial batch may still have posted
                             # orders we don't have ids for. Cancel everything on these
@@ -700,15 +764,19 @@ class Engine:
                  tox=round(est.markout.toxicity, 3), flowz=round(est.flow.z, 2))
         self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
 
+    def _placement_allowed(self, cid: str, epoch: int) -> bool:
+        return (
+            epoch == self._placement_epoch and self._running and not self._state_unknown
+            and cid not in self._halted and not self.risk.global_halt()[0]
+        )
+
     async def _quarantine(self, meta: MarketMeta, reason: str) -> None:
         """Cancel all orders on a market's tokens and resync state from REST."""
         log.warning("quarantine", cid=meta.condition_id[:8], reason=reason)
-        for tok in (meta.yes.token_id, meta.no.token_id):
-            if not await self.gateway.cancel_asset(tok):
-                self._state_unknown = True
-                return
-            for o in self.state.orders_for(tok):
-                self.state.remove_order(o.order_id)
+        self._state_unknown = True
+        self._reconcile_now.set()
+        if not await self._cancel_assets([meta.yes.token_id, meta.no.token_id]):
+            return
         try:
             await self._refresh_token_orders(meta)
         except GatewayReadError as exc:
@@ -799,13 +867,19 @@ class Engine:
                                        f"{len(expired)} stuck in-flight guards cleared")
 
                 positions_n, orders_n = await self._reconcile_authoritative_state()
-                if forced:
+                # The entire cycle fails closed, including local durable writes.
+                if rounds % 4 == 0:
+                    await self._check_position_divergence()
+                self.state.record_pnl(self.risk.equity, self.risk.net_cash,
+                                      self.risk.inventory_value, self.risk.daily_pnl)
+                if rounds % 20 == 0:
+                    self.state.checkpoint_wal()
+                if forced and not self._state_unknown:
                     log.info("forced_reconcile_done", positions=positions_n,
                              open_orders=orders_n)
                     self._wake_all()
-                self._state_unknown = False
                 read_failure_streak = 0
-            except GatewayReadError as exc:
+            except Exception as exc:
                 self._state_unknown = True
                 await self._cancel_managed_assets()
                 read_failure_streak += 1
@@ -816,17 +890,6 @@ class Engine:
                 log.warning("reconcile_backoff", failures=read_failure_streak,
                             delay_s=round(delay, 1))
                 await asyncio.sleep(delay)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("reconcile_error", err=str(exc))
-
-            # slower loops: on-chain position divergence + pnl snapshot + WAL
-            if rounds % 4 == 0:
-                with contextlib.suppress(Exception):
-                    await self._check_position_divergence()
-            self.state.record_pnl(self.risk.equity, self.risk.net_cash,
-                                  self.risk.inventory_value, self.risk.daily_pnl)
-            if rounds % 20 == 0:
-                self.state.checkpoint_wal()
 
     async def _check_position_divergence(self) -> None:
         """Compare internal positions to on-chain truth; alert + correct on drift.
@@ -839,21 +902,31 @@ class Engine:
         onchain = await self.gateway.token_balances(tokens)
         if not onchain:
             return
-        for tok, chain_size in onchain.items():
-            internal = self.state.position(tok).size
-            if abs(internal - chain_size) > max(1.0, 0.02 * chain_size):
-                log.error("position_divergence", token=tok[:12],
-                          internal=round(internal, 2), onchain=round(chain_size, 2))
-                self.alerter.alert(
-                    f"divergence:{tok[:8]}",
-                    f"position drift: internal {internal:.1f} vs on-chain {chain_size:.1f}",
-                    critical=True,
-                )
-                self.state.force_set_position(tok, chain_size, self.state.position(tok).avg_price,
-                                              source="onchain")
-                cid = self._token_cid.get(tok)
-                if cid:
-                    self._wake_cid(cid)
+        diverged = False
+        try:
+            for tok, chain_size in onchain.items():
+                if tok not in tokens or self.state.inflight(tok):
+                    continue
+                internal = self.state.position(tok).size
+                if abs(internal - chain_size) > max(1.0, 0.02 * chain_size):
+                    diverged = True
+                    self._state_unknown = True
+                    # Persist the proof requirement before correcting exposure so
+                    # a restart cannot migrate this drift into trusted holdings.
+                    self.state.set_sync_value(_TRADE_SYNC_REQUIRE_PROOF, "1")
+                    log.error("position_divergence", token=tok[:12],
+                              internal=round(internal, 2), onchain=round(chain_size, 2))
+                    self.alerter.alert(
+                        f"divergence:{tok[:8]}",
+                        f"position drift: internal {internal:.1f} vs on-chain {chain_size:.1f}",
+                        critical=True,
+                    )
+                    self.state.force_set_position(tok, chain_size, self.state.position(tok).avg_price,
+                                                  source="onchain")
+        finally:
+            if diverged:
+                self._reconcile_now.set()
+                await self._cancel_managed_assets()
 
     async def refresh_market_metadata(self) -> None:
         """Pull fresh metadata from Gamma for all traded markets: halt on
@@ -972,6 +1045,13 @@ class Engine:
                         o.notional for o in self.state.orders_for(tok) if o.side is Side.BUY
                     )
         return cost
+
+
+def _finite_float(value: float) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("nonfinite authoritative number")
+    return number
 
 
 def _fnum(v: object) -> float | None:

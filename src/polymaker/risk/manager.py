@@ -100,6 +100,10 @@ class RiskManager:
         )
 
     # ── PnL bookkeeping ─────────────────────────────────────────────────
+    def prepare_fill(self) -> None:
+        """Persist UTC rollover equity before a fill mutates durable inventory."""
+        self._ensure_day()
+
     def note_fill(self, fill: Fill) -> None:
         self._ensure_day()
         self._restored_daily_pnl = None

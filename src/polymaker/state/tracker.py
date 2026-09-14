@@ -53,10 +53,12 @@ class UserEventProcessor:
         store: StateStore,
         on_change: Callable[[str], None] | None = None,
         on_fill: Callable[[Fill], None] | None = None,
+        before_fill: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._on_change = on_change or (lambda _cid: None)
         self._on_fill = on_fill or (lambda _fill: None)
+        self._before_fill = before_fill or (lambda: None)
         # trade_id -> applied Fill, so FAILED can reverse exactly what we applied
         self._applied: dict[str, Fill] = {}
 
@@ -64,6 +66,7 @@ class UserEventProcessor:
         return Fill(ev.token_id, ev.our_side, ev.price, ev.size, ev.trade_id, ev.ts, is_maker=True)
 
     def _apply_fill(self, fill: Fill, ev: TradeEvent) -> bool:
+        self._before_fill()
         if ev.legacy_trade_id:
             return self._store.apply_fill(fill, aliases=(ev.legacy_trade_id,))
         return self._store.apply_fill(fill)
@@ -113,6 +116,7 @@ class UserEventProcessor:
                     prior.token_id, prior.side.opposite, prior.price, prior.size,
                     f"{prior.trade_id}:reverse", prior.ts, is_maker=True,
                 )
+                self._before_fill()
                 if self._store.apply_fill(reverse):
                     self._applied.pop(ev.trade_id)
                     self._store.clear_inflight(ev.token_id)

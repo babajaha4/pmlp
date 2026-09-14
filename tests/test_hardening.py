@@ -150,7 +150,7 @@ async def test_place_failure_triggers_quarantine(tmp_path, meta):
     eng = _mk_engine(tmp_path, meta)
     cancelled_assets: list[str] = []
 
-    async def failing_place(quotes, m):  # posts may or may not have landed
+    async def failing_place(quotes, m, **_kwargs):  # posts may or may not have landed
         return []
 
     async def spy_cancel_asset(asset_id):

@@ -6,11 +6,13 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
+import respx
 
 from polymaker.config import Config
 from polymaker.domain import Quote, Side
-from polymaker.execution.gateway import ExecutionGateway, _tick_str
+from polymaker.execution.gateway import ExecutionGateway, GatewayReadError, _tick_str
 from polymaker.execution.ratelimit import TokenBucket
 
 
@@ -86,3 +88,46 @@ async def test_gateway_trades_reads_valid_snapshot():
     assert await gateway.trades(after=123) == [row]
     assert seen == {"after": 123, "only_first_page": False}
     gateway.close()
+
+
+@pytest.mark.parametrize("mode", ["empty-live", "disconnected-live", "paper-no-client"])
+async def test_gateway_trade_snapshot_empty_and_disconnected_boundaries(mode):
+    gateway = ExecutionGateway(Config(), paper=mode == "paper-no-client")
+    if mode == "empty-live":
+        gateway._client = SimpleNamespace(get_trades=lambda *_args, **_kwargs: [])
+    try:
+        if mode == "disconnected-live":
+            with pytest.raises(GatewayReadError, match="not connected"):
+                await gateway.trades(after=123)
+        else:
+            assert await gateway.trades(after=123) == []
+    finally:
+        gateway.close()
+
+
+@pytest.mark.parametrize("field", ["size", "avgPrice"])
+@pytest.mark.parametrize("value", ["nan", "inf", 10 ** 400], ids=["nan", "inf", "huge"])
+@respx.mock
+async def test_gateway_positions_rejects_nonfinite_economics(field, value):
+    gateway = ExecutionGateway(Config())
+    gateway._funder = "0x0000000000000000000000000000000000000001"
+    row = {"asset": "token", "size": "10", "avgPrice": "0.5", field: value}
+    respx.get(f"{gateway._data_host}/positions").mock(return_value=httpx.Response(200, json=[row]))
+    try:
+        with pytest.raises(GatewayReadError):
+            await gateway.positions()
+    finally:
+        gateway.close()
+
+
+@pytest.mark.parametrize("field", ["price", "original_size", "size_matched"])
+async def test_gateway_orders_rejects_nonfinite_economics(field):
+    gateway = ExecutionGateway(Config())
+    row = {"id": "order", "asset_id": "token", "side": "BUY", "price": "0.5",
+           "original_size": "10", "size_matched": "0", field: "nan"}
+    gateway._client = SimpleNamespace(get_open_orders=lambda: [row])
+    try:
+        with pytest.raises(GatewayReadError):
+            await gateway.open_orders()
+    finally:
+        gateway.close()

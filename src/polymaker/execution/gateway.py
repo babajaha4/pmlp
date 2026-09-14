@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -151,10 +152,15 @@ class ExecutionGateway:
             log.warning("clock_check_failed", err=str(exc))
 
     # ── placement ───────────────────────────────────────────────────────
-    async def place(self, quotes: list[Quote], meta: MarketMeta) -> list[OpenOrder]:
+    async def place(
+        self, quotes: list[Quote], meta: MarketMeta,
+        *, can_place: Callable[[], bool] | None = None,
+    ) -> list[OpenOrder]:
         if not quotes:
             return []
         await self._order_bucket.acquire(len(quotes))
+        if can_place is not None and not can_place():
+            return []
         ts = time.time()
         self._journal_write("orders_out", [asdict(q) for q in quotes], ts)
 
@@ -510,15 +516,18 @@ class ExecutionGateway:
             for r in rows:
                 try:
                     side = Side(str(r["side"]).upper())
-                    remaining = float(r.get("original_size", r.get("size", 0))) - float(
-                        r.get("size_matched", 0)
-                    )
+                    original = float(r.get("original_size", r.get("size", 0)))
+                    matched = float(r.get("size_matched", 0))
+                    remaining = original - matched
+                    price = float(r["price"])
+                    if not all(math.isfinite(v) for v in (original, matched, remaining, price)):
+                        raise ValueError("nonfinite open-order economics")
                     out.append(
                         OpenOrder(
                             str(_first(r, "id", "orderID", "order_id")),
                             str(r["asset_id"]),
                             side,
-                            float(r["price"]),
+                            price,
                             remaining,
                             OrderState.LIVE,
                         )
@@ -581,11 +590,15 @@ class ExecutionGateway:
             async with httpx.AsyncClient(timeout=15.0) as c:
                 r = await c.get(f"{self._data_host}/positions", params={"user": user})
                 r.raise_for_status()
-                return {
-                    str(p["asset"]): (float(p["size"]), float(p.get("avgPrice", 0)))
-                    for p in r.json()
-                    if float(p.get("size", 0)) > 0
-                }
+                positions = {}
+                for p in r.json():
+                    size = float(p.get("size", 0))
+                    avg = float(p.get("avgPrice", 0))
+                    if not math.isfinite(size) or not math.isfinite(avg):
+                        raise ValueError("nonfinite position economics")
+                    if size > 0:
+                        positions[str(p["asset"])] = (size, avg)
+                return positions
         except Exception as exc:  # noqa: BLE001 - a snapshot failure is fail-closed
             log.warning("positions_failed", err=str(exc))
             raise GatewayReadError("positions snapshot unavailable") from exc
