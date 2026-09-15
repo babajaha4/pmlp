@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PolyMaker Control</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <meta name="control-token" content="__CONTROL_TOKEN__">
+  <meta name="poll-seconds" content="__POLL_SECONDS__">
+  <header class="topbar">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true">PM</div>
+      <div>
+        <h1>PolyMaker Control</h1>
+        <p id="environmentLine">VPS LIVE · 正在连接</p>
+      </div>
+    </div>
+    <div class="service-cluster">
+      <div id="serviceBadge" class="status-badge status-loading">
+        <span class="status-dot"></span><span>读取中</span>
+      </div>
+      <span id="refreshClock" class="refresh-clock">--</span>
+      <button id="refreshButton" class="icon-button" type="button" title="刷新数据" aria-label="刷新数据">↻</button>
+    </div>
+  </header>
+
+  <nav class="actionbar" aria-label="服务控制">
+    <div class="actionbar-inner">
+      <div class="action-state">
+        <span class="label">服务控制</span>
+        <strong id="processState">等待状态</strong>
+      </div>
+      <div class="action-buttons">
+        <button id="startButton" class="command command-start" type="button" data-action="start">
+          <span aria-hidden="true">▶</span><span>启动</span>
+        </button>
+        <button id="stopButton" class="command command-stop" type="button" data-action="stop">
+          <span aria-hidden="true">■</span><span>停止</span>
+        </button>
+        <button id="restartButton" class="command command-restart" type="button" data-action="restart">
+          <span aria-hidden="true">↻</span><span>重启</span>
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <div id="alertBand" class="alert-band hidden" role="alert"></div>
+
+  <main>
+    <section class="metric-grid" aria-label="关键指标">
+      <article class="metric">
+        <span class="metric-label">抵押余额</span>
+        <strong id="collateralMetric">--</strong>
+        <span class="metric-note">pUSD</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">策略权益</span>
+        <strong id="equityMetric">--</strong>
+        <span class="metric-note">当前 MTM</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">当日 PnL</span>
+        <strong id="dailyPnlMetric">--</strong>
+        <span class="metric-note">UTC 基准</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">最坏情况敞口</span>
+        <strong id="exposureMetric">--</strong>
+        <span id="exposureNote" class="metric-note">--</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">权威挂单</span>
+        <strong id="ordersMetric">--</strong>
+        <span id="ordersNote" class="metric-note">--</span>
+      </article>
+      <article class="metric">
+        <span class="metric-label">Maker 成交</span>
+        <strong id="fillsMetric">--</strong>
+        <span id="fillsNote" class="metric-note">--</span>
+      </article>
+    </section>
+
+    <section class="strategy-band" aria-label="当前策略摘要">
+      <div>
+        <span class="section-kicker">当前策略</span>
+        <h2 id="strategyHeadline">等待策略状态</h2>
+      </div>
+      <div id="strategyBadges" class="strategy-badges"></div>
+    </section>
+
+    <div class="tabs" role="tablist" aria-label="控制面板视图">
+      <button class="tab active" type="button" role="tab" aria-selected="true" data-tab="overview">概览</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="strategy">策略</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="health">运行健康</button>
+    </div>
+
+    <div id="overviewPanel" class="tab-panel active" role="tabpanel">
+      <section class="data-section">
+        <div class="section-heading">
+          <div><span class="section-kicker">Markets</span><h2>市场与风险占用</h2></div>
+          <span id="ledgerBadge" class="inline-state">账本校验中</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>市场</th><th>Regime</th><th>持仓价值</th><th>BUY 预留</th><th>总敞口</th><th>上限使用</th><th>挂单</th></tr></thead>
+            <tbody id="marketRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="data-section split-section">
+        <div class="split-pane">
+          <div class="section-heading"><div><span class="section-kicker">Inventory</span><h2>当前持仓</h2></div></div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead><tr><th>市场 / Outcome</th><th>数量</th><th>均价</th><th>Bid / Ask</th><th>MTM</th><th>未实现</th></tr></thead>
+              <tbody id="positionRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="split-pane">
+          <div class="section-heading"><div><span class="section-kicker">Risk</span><h2>风险限制</h2></div></div>
+          <div id="riskBars" class="risk-bars"></div>
+        </div>
+      </section>
+
+      <section class="data-section">
+        <div class="section-heading"><div><span class="section-kicker">Orders</span><h2>权威挂单</h2></div><span id="managedOrdersBadge" class="inline-state"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>市场</th><th>Outcome</th><th>方向</th><th>价格</th><th>剩余数量</th><th>Notional</th><th>管理范围</th></tr></thead>
+            <tbody id="orderRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="data-section">
+        <div class="section-heading"><div><span class="section-kicker">Fills</span><h2>最近成交</h2></div><span id="fillSummary" class="inline-state"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时间</th><th>市场</th><th>Outcome</th><th>方向</th><th>价格</th><th>数量</th><th>Notional</th><th>流动性</th></tr></thead>
+            <tbody id="fillRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div id="strategyPanel" class="tab-panel" role="tabpanel" hidden>
+      <section class="data-section">
+        <div class="section-heading"><div><span class="section-kicker">Execution Model</span><h2>生效策略规则</h2></div></div>
+        <div class="rule-grid">
+          <article><strong>双边 Maker 报价</strong><p>使用 BUY YES 与 BUY NO 建立双边流动性；所有订单强制 post-only，不主动吃单。</p></article>
+          <article><strong>波动与毒性扩点</strong><p>半价差由基础 tick、短期波动和订单流毒性共同决定；环境恶化时自动远离盘口。</p></article>
+          <article><strong>库存偏斜</strong><p>持仓接近 soft cap 时缩小增加库存一侧；达到硬上限后只允许减仓。</p></article>
+          <article><strong>状态机保护</strong><p>QUIET 正常报价，TRENDING 半量，EVENT 暂停，REDUCE_ONLY 仅退出，HALTED 不挂单。</p></article>
+        </div>
+      </section>
+      <section class="data-section">
+        <div class="section-heading"><div><span class="section-kicker">Profiles</span><h2>市场参数</h2></div></div>
+        <div id="profileRows" class="profile-list"></div>
+      </section>
+    </div>
+
+    <div id="healthPanel" class="tab-panel" role="tabpanel" hidden>
+      <section class="data-section">
+        <div class="section-heading"><div><span class="section-kicker">Service</span><h2>进程与权威读取</h2></div></div>
+        <dl id="healthGrid" class="health-grid"></dl>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="confirmDialog" class="confirm-dialog">
+    <form method="dialog">
+      <div id="dialogIcon" class="dialog-icon" aria-hidden="true">■</div>
+      <h2 id="dialogTitle">确认操作</h2>
+      <p id="dialogText"></p>
+      <div class="dialog-actions">
+        <button class="command command-neutral" value="cancel">取消</button>
+        <button id="confirmActionButton" class="command command-stop" value="confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -83,11 +83,52 @@ uv run polymaker status        # positions / open orders
 uv run polymaker cancel-all    # panic button
 uv run polymaker halt           # persist kill switch + cancel only configured tokens
 uv run polymaker resume --confirm  # preflight, then clear kill switch
+uv run polymaker control-panel    # loopback VPS dashboard + start/stop/restart
 
 # offline research: replay captured L2 without wallet or network access
 uv run polymaker backtest journal/paper.jsonl
 uv run polymaker backtest journal/paper.jsonl --queue-ahead 1 --latency-ms 250 --json
 ```
+
+### Local control panel
+
+On the Windows operator machine, `control-panel` uses the existing Bitvise
+profile to read authoritative VPS state and control only
+`polymaker-live.service`:
+
+```powershell
+uv run polymaker control-panel
+# http://127.0.0.1:8765
+```
+
+The defaults match the production setup used by this repository:
+
+```text
+sexec:      C:\Program Files (x86)\Bitvise SSH Client\sexec.exe
+profile:    %USERPROFILE%\Desktop\malai.tlp
+VPS repo:   /home/ubuntu/pmlp
+config:     livecfg
+unit:       polymaker-live.service
+```
+
+Override any of them with `--sexec`, `--profile`, `--remote-dir`,
+`--remote-config-dir`, or `--unit`. The HTTP server refuses non-loopback bind
+addresses. Service actions require a same-origin request, a per-process random
+control token, and an operator confirmation dialog.
+
+The dashboard shows exchange-authoritative collateral, positions and open
+orders; read-only SQLite fills and risk state; current midpoint MTM; reservation
+headroom; current market regime; and every effective strategy profile. It
+refreshes every 20 seconds by default. Snapshot collection sends a compressed
+read-only Python probe through SSH and does not install files or write the VPS
+database.
+
+`Stop` sends `SIGINT`, so normal shutdown cancels only configured-token orders
+before exiting. `Restart` performs that same graceful shutdown and then starts
+one fresh LIVE process. `Start` recreates the transient unit with
+`--live --confirm-live` when it has been unloaded. None of these buttons calls
+the wallet-wide `cancel-all`, clears a kill state, changes strategy parameters,
+or bypasses startup reconciliation.
 
 ### Journal replay assumptions
 

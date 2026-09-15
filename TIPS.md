@@ -6,6 +6,12 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
 
 ## Running & watching
 
+- **Use the loopback control panel for routine operations.** On the Windows
+  operator machine, `uv run polymaker control-panel` opens
+  `http://127.0.0.1:8765`. It reads exchange truth and the durable ledger over
+  the configured Bitvise profile, displays the effective strategy/regime, and
+  provides confirmed start/stop/restart actions for `polymaker-live.service`.
+  Keep it bound to loopback; it is an operator surface, not a public dashboard.
 - **Run exactly ONE engine.** `uv run polymaker run` is paper mode; LIVE requires
   `uv run polymaker run --live --confirm-live`. If you background it, verify
   with `pgrep -f "polymaker run"` and `grep -c engine_started <logfile>` — two
@@ -174,6 +180,7 @@ uv run polymaker cancel-all    # pull every resting order
 uv run polymaker halt          # kill + cancel all wallet orders on configured tokens
 uv run polymaker resume --confirm
 uv run polymaker backtest journal/paper.jsonl  # offline L2 replay; no wallet calls
+uv run polymaker control-panel  # local VPS data + confirmed service controls
 ```
 
 Config lives in `config/*.toml`: `config.toml` (wallet/engine/risk), `strategy.toml`

@@ -6,6 +6,7 @@
   polymaker status               positions / open orders / PnL (reads SQLite)
   polymaker doctor               preflight: wallet auth, balances, WS reachability
   polymaker backtest <journal>   replay captured L2 data without network access
+  polymaker control-panel        local VPS dashboard and service controls
   polymaker run [--paper|--live --confirm-live]  start the market maker
   polymaker cancel-all           panic button
 """
@@ -385,6 +386,74 @@ def resume(
     finally:
         store.close()
     console.print("[green]Kill switch cleared after successful preflight.[/green]")
+
+
+@app.command(name="control-snapshot", hidden=True)
+def control_snapshot(
+    config_dir: str = typer.Option("livecfg", help="config directory"),
+    unit: str = typer.Option("polymaker-live.service", help="systemd unit name"),
+) -> None:
+    """Emit a read-only JSON snapshot for the loopback control panel."""
+    from polymaker.monitoring import collect_live_snapshot
+
+    cfg = Config.load(config_dir)
+    try:
+        snapshot = asyncio.run(collect_live_snapshot(cfg, unit=unit))
+    except Exception as exc:  # noqa: BLE001 - CLI boundary returns a non-zero status
+        typer.echo(f"Control snapshot failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo("POLYMAKER_SNAPSHOT_BEGIN")
+    typer.echo(json.dumps(snapshot, separators=(",", ":"), sort_keys=True))
+    typer.echo("POLYMAKER_SNAPSHOT_END")
+
+
+@app.command(name="control-panel")
+def control_panel(
+    sexec: Path | None = typer.Option(  # noqa: B008
+        None,
+        help="path to Bitvise sexec.exe",
+    ),
+    profile: Path | None = typer.Option(  # noqa: B008
+        None,
+        help="path to the Bitvise .tlp profile",
+    ),
+    remote_dir: str = typer.Option("/home/ubuntu/pmlp", help="VPS project directory"),
+    remote_config_dir: str = typer.Option("livecfg", help="VPS config directory"),
+    unit: str = typer.Option("polymaker-live.service", help="VPS systemd unit"),
+    host: str = typer.Option("127.0.0.1", help="loopback bind address"),
+    port: int = typer.Option(8765, min=1, max=65535, help="local HTTP port"),
+    poll_seconds: int = typer.Option(20, min=5, max=300, help="refresh interval"),
+    open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser"),
+) -> None:
+    """Run the loopback-only VPS operations dashboard."""
+    from polymaker.control_panel import ControlSettings, serve_control_panel
+
+    resolved_sexec = sexec or Path(r"C:\Program Files (x86)\Bitvise SSH Client\sexec.exe")
+    resolved_profile = profile or Path.home() / "Desktop" / "malai.tlp"
+    settings = ControlSettings(
+        sexec=resolved_sexec,
+        profile=resolved_profile,
+        remote_dir=remote_dir,
+        remote_config_dir=remote_config_dir,
+        unit=unit,
+    )
+    url = f"http://{host}:{port}"
+    try:
+        settings.validate()
+        console.print(f"[bold]PolyMaker control panel:[/bold] {url}")
+        console.print("[dim]Local loopback only. Press Ctrl+C to close the panel.[/dim]")
+        serve_control_panel(
+            settings,
+            host=host,
+            port=port,
+            poll_seconds=poll_seconds,
+            open_browser=open_browser,
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Control panel failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Control panel stopped.[/yellow]")
 
 
 @app.command()
