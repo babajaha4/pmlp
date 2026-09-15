@@ -53,11 +53,24 @@ _TRADE_SYNC_OVERLAP_S = 300
 _TRADE_SYNC_PENDING = "confirmed_trade_pending"
 _TRADE_SYNC_REQUIRE_PROOF = "confirmed_trade_requires_proof"
 _TRADE_SYNC_PENDING_MAX_AGE_S = 7 * 86400
+# The Data API publishes position sizes to four decimal places. Compare its
+# snapshot at half of that display unit; durable fills retain full precision.
+_REST_POSITION_ABS_TOL = 0.00005
+_STRICT_POSITION_ABS_TOL = 0.000001
 
 
 def _utc_day_start_ts(now: float | None = None) -> int:
     dt = datetime.fromtimestamp(time.time() if now is None else now, tz=UTC)
     return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def _rest_position_matches(ledger_size: float, rest_size: float) -> bool:
+    tolerance = (
+        _REST_POSITION_ABS_TOL
+        if ledger_size > 0.0 and rest_size > 0.0
+        else _STRICT_POSITION_ABS_TOL
+    )
+    return math.isclose(ledger_size, rest_size, rel_tol=0.0, abs_tol=tolerance)
 
 
 class Engine:
@@ -463,11 +476,11 @@ class Engine:
     def _positions_explained(self, positions: dict[str, tuple[float, float]]) -> bool:
         ledger = self.state.fill_position_sizes()
         return all(
-            math.isclose(
+            _rest_position_matches(
                 ledger.get(tok, 0.0) + float(self.state.get_sync_value(
                     f"confirmed_trade_baseline:{tok}"
                 ) or "0"),
-                positions.get(tok, (0.0, 0.0))[0], abs_tol=1e-6,
+                positions.get(tok, (0.0, 0.0))[0],
             ) for tok in self._token_cid
         )
 

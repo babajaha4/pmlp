@@ -434,3 +434,75 @@ async def test_nonfinite_authoritative_numbers_cannot_initialize(tmp_path, meta,
         await eng._reconcile_authoritative_state()
     assert eng._state_unknown
     assert eng.state.get_sync_value("confirmed_trade_sync_initialized") is None
+
+
+@pytest.mark.parametrize(
+    ("ledger_size", "rest_size"),
+    [(45.102919, 45.1029), (45.102951, 45.1030)],
+)
+async def test_rest_position_display_rounding_does_not_quarantine_confirmed_ledger(
+    tmp_path, meta, ledger_size, rest_size,
+):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    for token in (meta.yes.token_id, meta.no.token_id):
+        eng.state.set_sync_value(f"confirmed_trade_baseline:{token}", "0")
+    payload = _confirmed_trade(meta)
+    payload["maker_orders"][0].update(price="0.124", matched_amount=str(ledger_size))
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    eng.gateway.positions = AsyncMock(
+        return_value={meta.yes.token_id: (rest_size, 0.124)}
+    )
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+
+    await eng._reconcile_authoritative_state()
+
+    assert not eng._state_unknown
+    assert eng.state.fill_position_sizes()[meta.yes.token_id] == pytest.approx(ledger_size)
+    assert eng.state.position(meta.yes.token_id).size == pytest.approx(rest_size)
+    assert eng.risk.net_cash == pytest.approx(-0.124 * ledger_size)
+
+
+async def test_rest_position_difference_beyond_display_rounding_stays_quarantined(
+    tmp_path, meta,
+):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    for token in (meta.yes.token_id, meta.no.token_id):
+        eng.state.set_sync_value(f"confirmed_trade_baseline:{token}", "0")
+    payload = _confirmed_trade(meta)
+    payload["maker_orders"][0].update(price="0.124", matched_amount="45.102919")
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    eng.gateway.positions = AsyncMock(
+        return_value={meta.yes.token_id: (45.1028, 0.124)}
+    )
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+
+    with pytest.raises(GatewayReadError, match="confirmed trades do not explain positions"):
+        await eng._reconcile_authoritative_state()
+
+    assert eng._state_unknown
+    eng.gateway.open_orders.assert_not_awaited()
+
+
+async def test_rest_position_display_tolerance_cannot_hide_nonzero_inventory(
+    tmp_path, meta,
+):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway._funder = FUNDER
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    for token in (meta.yes.token_id, meta.no.token_id):
+        eng.state.set_sync_value(f"confirmed_trade_baseline:{token}", "0")
+    payload = _confirmed_trade(meta)
+    payload["maker_orders"][0].update(price="0.124", matched_amount="0.00004")
+    eng.gateway.trades = AsyncMock(return_value=[payload])
+    eng.gateway.positions = AsyncMock(return_value={})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+
+    with pytest.raises(GatewayReadError, match="confirmed trades do not explain positions"):
+        await eng._reconcile_authoritative_state()
+
+    assert eng._state_unknown
+    eng.gateway.open_orders.assert_not_awaited()
