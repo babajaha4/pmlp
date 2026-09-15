@@ -7,3 +7,23 @@ enabled = true
 slug    = "will-jd-vance-win-the-2028-republican-presidential-nomination"
 profile = "live-tiny"
 enabled = true
+
+[[markets]]
+slug    = "will-russia-invade-another-country-in-2026"
+profile = "live-tiny"
+enabled = true
+
+[[markets]]
+slug    = "china-x-taiwan-military-clash-before-2027"
+profile = "live-tiny"
+enabled = true
+
+[[markets]]
+slug    = "iran-nuke-before-2027"
+profile = "live-tiny"
+enabled = true
+
+[[markets]]
+slug    = "will-the-us-acquire-any-part-of-greenland-in-2026"
+profile = "live-tiny"
+enabled = true

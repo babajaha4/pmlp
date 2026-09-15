@@ -1,4 +1,5 @@
-# CONSERVATIVE live-test config (Fable autonomous run, ~$50 mandate).
+# Phase-one conservative LIVE config. Scale across independent markets while
+# retaining small per-market quotes and explicit hard risk limits.
 [wallet]
 chain_id = 137
 signature_type = 3
@@ -17,7 +18,7 @@ journal = true
 loop = "uvloop"
 
 [risk]
-max_total_exposure_usdc = 40.0       # hard ceiling on deployed capital
+max_total_exposure_usdc = 60.0       # phase-one hard ceiling on deployed capital
 max_event_group_loss_usdc = 30.0
 max_market_notional_usdc = 15.0      # per-market cap
 daily_loss_kill_usdc = 12.0          # stop trading at ~$12 mark-to-market loss
