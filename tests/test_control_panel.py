@@ -318,6 +318,47 @@ async def test_true_empty_exchange_snapshot_remains_healthy(tmp_path, meta):
     assert snapshot["summary"]["ledger_matches_positions"]
 
 
+@pytest.mark.parametrize(
+    ("residual", "expected"),
+    [(0.002919, True), (0.01, False)],
+)
+async def test_snapshot_applies_bounded_rest_omitted_dust_rule(
+    tmp_path, meta, residual, expected,
+):
+    class OmittedPositionGateway(FakeGateway):
+        async def open_orders(self) -> list[OpenOrder]:
+            return []
+
+        async def positions(self) -> dict[str, tuple[float, float]]:
+            return {}
+
+    db = tmp_path / "dust.db"
+    catalog = CatalogStore(db)
+    catalog.upsert_market(meta)
+    catalog.close()
+    state = StateStore(db)
+    state.apply_fill(Fill(
+        meta.yes.token_id, Side.BUY, 0.13, residual, "dust-fill", is_maker=True,
+    ))
+    state.close()
+    cfg = Config(
+        paths=PathsConfig(db=str(db), log_dir=str(tmp_path), journal_dir=str(tmp_path)),
+        profiles={"tiny": StrategyProfile()},
+        markets=[MarketEntry(slug=meta.slug, profile="tiny")],
+    )
+
+    snapshot = await collect_live_snapshot(
+        cfg,
+        gateway=OmittedPositionGateway(),
+        service_status={
+            "load_state": "loaded", "active_state": "active", "sub_state": "running",
+            "main_pid": 123, "restarts": 0, "active_since": "",
+        },
+    )
+
+    assert snapshot["summary"]["ledger_matches_positions"] is expected
+
+
 def test_control_panel_assets_do_not_embed_secrets(tmp_path):
     app = ControlPanelApplication(BitviseControl(_settings(tmp_path)), "127.0.0.1", 8765, 20)
     page = app.page().decode()

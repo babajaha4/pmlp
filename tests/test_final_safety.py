@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from polymaker.domain import OpenOrder, OrderState, Side
+from polymaker.domain import Fill, OpenOrder, OrderState, Side
 from polymaker.execution.gateway import GatewayReadError
 from polymaker.userstream.parse import normalize_trade
 from tests.test_engine import _engine_with_market, _feed_book
@@ -487,22 +487,25 @@ async def test_rest_position_difference_beyond_display_rounding_stays_quarantine
     eng.gateway.open_orders.assert_not_awaited()
 
 
-async def test_rest_position_display_tolerance_cannot_hide_nonzero_inventory(
+async def test_rest_omitted_positive_dust_does_not_quarantine_confirmed_ledger(
     tmp_path, meta,
 ):
     eng = _engine_with_market(tmp_path, meta)
-    eng.gateway._funder = FUNDER
     eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
     for token in (meta.yes.token_id, meta.no.token_id):
         eng.state.set_sync_value(f"confirmed_trade_baseline:{token}", "0")
-    payload = _confirmed_trade(meta)
-    payload["maker_orders"][0].update(price="0.124", matched_amount="0.00004")
-    eng.gateway.trades = AsyncMock(return_value=[payload])
+    eng.state.apply_fill(Fill(
+        meta.yes.token_id, Side.BUY, 0.13, 45.102919, "dust-buy", is_maker=True,
+    ))
+    eng.state.apply_fill(Fill(
+        meta.yes.token_id, Side.SELL, 0.13, 45.1, "dust-sell", is_maker=True,
+    ))
+    eng.gateway.trades = AsyncMock(return_value=[])
     eng.gateway.positions = AsyncMock(return_value={})
     eng.gateway.open_orders = AsyncMock(return_value=[])
 
-    with pytest.raises(GatewayReadError, match="confirmed trades do not explain positions"):
-        await eng._reconcile_authoritative_state()
+    await eng._reconcile_authoritative_state()
 
-    assert eng._state_unknown
-    eng.gateway.open_orders.assert_not_awaited()
+    assert not eng._state_unknown
+    assert eng.state.fill_position_sizes()[meta.yes.token_id] == pytest.approx(0.002919)
+    eng.gateway.open_orders.assert_awaited_once()

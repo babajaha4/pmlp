@@ -31,6 +31,7 @@ from polymaker.logging import get_logger
 from polymaker.marketdata.parse import TradePrint
 from polymaker.marketdata.service import MarketDataService
 from polymaker.merge import Merger
+from polymaker.position_tolerance import authoritative_position_matches
 from polymaker.risk.manager import RiskManager
 from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
@@ -53,25 +54,11 @@ _TRADE_SYNC_OVERLAP_S = 300
 _TRADE_SYNC_PENDING = "confirmed_trade_pending"
 _TRADE_SYNC_REQUIRE_PROOF = "confirmed_trade_requires_proof"
 _TRADE_SYNC_PENDING_MAX_AGE_S = 7 * 86400
-# The Data API publishes position sizes to four decimal places. Compare its
-# snapshot at half of that display unit; durable fills retain full precision.
-_REST_POSITION_ABS_TOL = 0.00005
-_STRICT_POSITION_ABS_TOL = 0.000001
 
 
 def _utc_day_start_ts(now: float | None = None) -> int:
     dt = datetime.fromtimestamp(time.time() if now is None else now, tz=UTC)
     return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-
-
-def _rest_position_matches(ledger_size: float, rest_size: float) -> bool:
-    tolerance = (
-        _REST_POSITION_ABS_TOL
-        if ledger_size > 0.0 and rest_size > 0.0
-        else _STRICT_POSITION_ABS_TOL
-    )
-    return math.isclose(ledger_size, rest_size, rel_tol=0.0, abs_tol=tolerance)
-
 
 class Engine:
     def __init__(self, cfg: Config, *, paper: bool = False) -> None:
@@ -476,7 +463,7 @@ class Engine:
     def _positions_explained(self, positions: dict[str, tuple[float, float]]) -> bool:
         ledger = self.state.fill_position_sizes()
         return all(
-            _rest_position_matches(
+            authoritative_position_matches(
                 ledger.get(tok, 0.0) + float(self.state.get_sync_value(
                     f"confirmed_trade_baseline:{tok}"
                 ) or "0"),

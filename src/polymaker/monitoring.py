@@ -17,6 +17,7 @@ from polymaker.catalog.store import _load_meta
 from polymaker.config import Config, MarketEntry, StrategyProfile
 from polymaker.domain import MarketMeta, OpenOrder, Side
 from polymaker.execution.gateway import ExecutionGateway
+from polymaker.position_tolerance import authoritative_position_matches
 
 
 class MonitoringGateway(Protocol):
@@ -422,16 +423,9 @@ async def collect_live_snapshot(
             )
         }
         ledger_matches = all(
-            math.isclose(
+            authoritative_position_matches(
                 ledger_positions.get(token_id, 0.0),
                 positions.get(token_id, (0.0, 0.0))[0],
-                rel_tol=0.0,
-                abs_tol=(
-                    0.00005
-                    if ledger_positions.get(token_id, 0.0) > 0
-                    and positions.get(token_id, (0.0, 0.0))[0] > 0
-                    else 0.000001
-                ),
             )
             for token_id in token_info
         )
