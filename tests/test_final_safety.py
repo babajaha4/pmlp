@@ -438,7 +438,7 @@ async def test_nonfinite_authoritative_numbers_cannot_initialize(tmp_path, meta,
 
 @pytest.mark.parametrize(
     ("ledger_size", "rest_size"),
-    [(45.102919, 45.1029), (45.102951, 45.1030)],
+    [(45.102919, 45.1029), (45.102951, 45.1030), (2.287254, 2.2872)],
 )
 async def test_rest_position_display_rounding_does_not_quarantine_confirmed_ledger(
     tmp_path, meta, ledger_size, rest_size,

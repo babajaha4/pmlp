@@ -215,6 +215,10 @@ Maker-only, quoting both sides of each market as USDC-collateralized bids:
 - **Inventory skew** — net position leans both quotes: long YES → bid YES lower,
   bid NO higher (acquire the offsetting leg). Size tapers as inventory approaches
   a soft cap, then the adding side is pulled entirely.
+- **Aged inventory exits** — held inventory is offered maker-only, walking from
+  fair value toward the touch over `exit_urgency_s`. The default is one hour;
+  shorter windows should be justified by replay because they can crystallize
+  adverse-selection losses.
 - **Volatility / toxicity** — realized-vol and per-fill markout (adverse
   selection) EWMAs widen the spread and shrink size in markets that pick us off.
 - **Regime machine** — per market: `QUIET` (farm rewards in-band), `TRENDING`

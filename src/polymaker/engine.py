@@ -41,7 +41,12 @@ from polymaker.strategy.estimators import (
     MarkoutTracker,
     VolEstimator,
 )
-from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
+from polymaker.strategy.quoting import (
+    QuoteInputs,
+    compute_exit_urgency,
+    compute_fair_value,
+    construct_quotes,
+)
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
 from polymaker.userstream.parse import normalize_trade
@@ -726,6 +731,12 @@ class Engine:
             no_view=(no_book.view() if no_book else _empty_view()),
             pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
             risk_size_scale=rd.size_scale,
+            yes_exit_urgency=compute_exit_urgency(
+                self.state.last_fill_ts(meta.yes.token_id), now, p.exit_urgency_s,
+            ),
+            no_exit_urgency=compute_exit_urgency(
+                self.state.last_fill_ts(meta.no.token_id), now, p.exit_urgency_s,
+            ),
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)

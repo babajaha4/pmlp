@@ -7,6 +7,7 @@ import pytest
 from polymaker.domain import Position, Regime, Side
 from polymaker.strategy.quoting import (
     QuoteInputs,
+    compute_exit_urgency,
     compute_fair_value,
     construct_quotes,
     round_to_tick,
@@ -30,6 +31,24 @@ def _inputs(meta, profile, **over):
     )
     base.update(over)
     return QuoteInputs(**base)
+
+
+@pytest.mark.parametrize(
+    ("last_fill_ts", "now", "urgency_s", "expected"),
+    [
+        (None, 1000.0, 600.0, 0.0),
+        (1000.0, 1000.0, 600.0, 0.0),
+        (700.0, 1000.0, 600.0, 0.5),
+        (400.0, 1000.0, 600.0, 1.0),
+        (0.0, 1000.0, 0.0, 0.0),
+        (0.0, 1000.0, float("nan"), 0.0),
+        (1100.0, 1000.0, 600.0, 0.0),
+    ],
+)
+def test_compute_exit_urgency(
+    last_fill_ts: float | None, now: float, urgency_s: float, expected: float,
+) -> None:
+    assert compute_exit_urgency(last_fill_ts, now, urgency_s) == pytest.approx(expected)
 
 
 # ── round_to_tick ──────────────────────────────────────────────────────────

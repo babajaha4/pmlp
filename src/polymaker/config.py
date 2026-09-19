@@ -155,7 +155,7 @@ class StrategyProfile(BaseModel):
     reduce_only_hours: float = 24.0
     halt_before_hours: float = 2.0
     # exits
-    exit_urgency_s: float = 900.0
+    exit_urgency_s: float = 3600.0
     merge_min_size: float = 20.0
 
     def with_overrides(self, overrides: dict[str, Any]) -> StrategyProfile:

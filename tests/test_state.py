@@ -62,11 +62,21 @@ def test_reconcile_positions_skips_inflight_and_recent(tmp_path):
 def test_state_persists_across_restart(tmp_path):
     db = tmp_path / "s.db"
     s = StateStore(db)
-    s.apply_fill(Fill("tok", Side.BUY, 0.5, 100, "t1"))
+    s.apply_fill(Fill("tok", Side.BUY, 0.5, 100, "t1", ts=123.0))
     s.close()
     s2 = StateStore(db)
     assert s2.position("tok").size == 100
+    assert s2.last_fill_ts("tok") == 123.0
     s2.close()
+
+
+def test_last_fill_time_tracks_latest_inventory_change(tmp_path):
+    s = StateStore(tmp_path / "s.db")
+    assert s.last_fill_ts("tok") is None
+    s.apply_fill(Fill("tok", Side.BUY, 0.5, 100, "t1", ts=10.0))
+    s.apply_fill(Fill("tok", Side.SELL, 0.6, 25, "t2", ts=20.0))
+    assert s.last_fill_ts("tok") == 20.0
+    s.close()
 
 
 def test_apply_fill_rejects_legacy_alias(tmp_path):

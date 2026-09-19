@@ -27,7 +27,12 @@ from polymaker.strategy.estimators import (
     MarkoutTracker,
     VolEstimator,
 )
-from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
+from polymaker.strategy.quoting import (
+    QuoteInputs,
+    compute_exit_urgency,
+    compute_fair_value,
+    construct_quotes,
+)
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 
 
@@ -365,6 +370,12 @@ class JournalBacktester:
                 profile=profile,
                 now=ts,
                 risk_size_scale=decision.size_scale,
+                yes_exit_urgency=compute_exit_urgency(
+                    self.state.last_fill_ts(meta.yes.token_id), ts, profile.exit_urgency_s,
+                ),
+                no_exit_urgency=compute_exit_urgency(
+                    self.state.last_fill_ts(meta.no.token_id), ts, profile.exit_urgency_s,
+                ),
             )
         )
 

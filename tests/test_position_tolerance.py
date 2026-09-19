@@ -17,6 +17,9 @@ from polymaker.position_tolerance import authoritative_position_matches
         (0.1, 0.0, False),
         (-0.000001, 0.0, False),
         (45.102919, 45.1029, True),
+        (2.287254, 2.2872, True),
+        (45.102999, 45.1029, True),
+        (45.103, 45.1029, False),
         (45.102919, 45.1028, False),
     ],
 )

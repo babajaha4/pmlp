@@ -203,6 +203,10 @@ class StateStore:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM fills").fetchone()
         return int(row["count"])
 
+    def last_fill_ts(self, token_id: str) -> float | None:
+        """Return the latest durable inventory-change time for a token."""
+        return self._last_fill_ts.get(token_id)
+
     def fill_position_sizes(self) -> dict[str, float]:
         """Signed inventory from durable fills, independent of REST corrections."""
         return {str(row["token_id"]): float(row["size"]) for row in self._conn.execute(
@@ -435,6 +439,11 @@ class StateStore:
                 self.positions[row["token_id"]] = Position(
                     row["token_id"], row["size"], row["avg_price"]
                 )
+        for row in self._conn.execute(
+            "SELECT token_id,MAX(ts) AS last_fill_ts FROM fills GROUP BY token_id"
+        ):
+            if row["last_fill_ts"] is not None:
+                self._last_fill_ts[str(row["token_id"])] = float(row["last_fill_ts"])
 
     def drop_untracked_positions(self, tracked: set[str]) -> list[str]:
         """Remove positions for tokens we don't trade (e.g. the operator's manual

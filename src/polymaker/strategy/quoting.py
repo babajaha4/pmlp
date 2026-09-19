@@ -40,6 +40,20 @@ def compute_fair_value(microprice: float, flow_z: float, tick: float, weight: fl
     return min(max(fv, tick), 1.0 - tick)
 
 
+def compute_exit_urgency(last_fill_ts: float | None, now: float, urgency_s: float) -> float:
+    """Increase maker-only exit urgency from zero to one as inventory ages."""
+    if (
+        last_fill_ts is None
+        or not math.isfinite(last_fill_ts)
+        or not math.isfinite(now)
+        or not math.isfinite(urgency_s)
+        or urgency_s <= 0.0
+    ):
+        return 0.0
+    elapsed = max(0.0, now - last_fill_ts)
+    return _clamp(elapsed / urgency_s, 0.0, 1.0)
+
+
 @dataclass(frozen=True, slots=True)
 class QuoteInputs:
     meta: MarketMeta

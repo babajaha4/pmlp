@@ -37,7 +37,7 @@ end_date_taper_days = 7
 reduce_only_hours   = 24
 halt_before_hours   = 2
 # --- exits ---
-exit_urgency_s      = 900
+exit_urgency_s      = 3600    # reach the maker touch gradually over one hour
 merge_min_size      = 20.0
 
 
@@ -83,5 +83,5 @@ end_date_taper_days = 7
 reduce_only_hours   = 24
 halt_before_hours   = 2
 # --- exits ---
-exit_urgency_s      = 900
+exit_urgency_s      = 3600    # reach the maker touch gradually over one hour
 merge_min_size      = 20.0

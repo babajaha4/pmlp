@@ -651,6 +651,33 @@ async def test_quoter_wake_cadence(tmp_path, meta):
     eng.catalog.close()
 
 
+async def test_aged_inventory_exit_walks_to_maker_touch(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    _feed_book(eng, meta)
+    profile = eng.profiles[meta.condition_id]
+    eng.state.apply_fill(Fill(
+        meta.yes.token_id,
+        Side.BUY,
+        0.2,
+        10,
+        "aged-fill",
+        ts=time.time() - profile.exit_urgency_s - 1,
+    ))
+
+    await eng._recompute(meta.condition_id)
+
+    sells = [
+        order for order in eng.state.orders.values()
+        if order.token_id == meta.yes.token_id and order.side is Side.SELL
+    ]
+    assert len(sells) == 1
+    best_bid = eng.md.book(meta.yes.token_id).best_bid()
+    assert best_bid is not None
+    assert sells[0].price == pytest.approx(best_bid.price + meta.tick_size)
+    eng.state.close()
+    eng.catalog.close()
+
+
 # ── a quiet market with a live WS link must NOT false-halt ───────────────
 async def test_quiet_market_with_live_link_is_not_stale(tmp_path, meta):
     """Thin/quiet markets go long stretches with no book mutation. Halting on
