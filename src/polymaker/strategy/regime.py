@@ -34,12 +34,13 @@ class RegimeInputs:
 
 
 class RegimeMachine:
-    """Stateful regime decider for one market (tracks the EVENT cooloff)."""
+    """Stateful regime decider with EVENT cooloff and TRENDING hysteresis."""
 
-    __slots__ = ("_event_until",)
+    __slots__ = ("_event_until", "_trending")
 
     def __init__(self) -> None:
         self._event_until: float = 0.0
+        self._trending = False
 
     def decide(self, inp: RegimeInputs, p: StrategyProfile) -> Regime:
         # 1. hard halts
@@ -62,8 +63,18 @@ class RegimeMachine:
         if inp.hours_to_end is not None and inp.hours_to_end <= p.reduce_only_hours:
             return Regime.REDUCE_ONLY
 
-        # 4. trending
-        if abs(inp.flow_z) >= p.trend_flow_z or inp.vol_ratio >= p.trend_vol_ratio:
+        # 4. trending. Once entered, require both signals to clear lower exit
+        # thresholds before returning to QUIET; otherwise boundary jitter makes
+        # the half-size posture cancel/replace every order on successive ticks.
+        flow_strength = abs(inp.flow_z)
+        if self._trending:
+            flow_exit = p.trend_flow_z * p.trend_exit_frac
+            vol_exit = 1.0 + (p.trend_vol_ratio - 1.0) * p.trend_exit_frac
+            if flow_strength < flow_exit and inp.vol_ratio < vol_exit:
+                self._trending = False
+        elif flow_strength >= p.trend_flow_z or inp.vol_ratio >= p.trend_vol_ratio:
+            self._trending = True
+        if self._trending:
             return Regime.TRENDING
 
         # 5. default

@@ -150,6 +150,9 @@ class StrategyProfile(BaseModel):
     # book microprice jitter inflates this without real trade flow, so raise it
     # for reward-farming markets that trade rarely.
     trend_vol_ratio: float = 2.0
+    # TRENDING exits only after both signals fall below this fraction of their
+    # entry distance. This prevents boundary noise from flipping quote size.
+    trend_exit_frac: float = Field(default=0.8, gt=0.0, lt=1.0)
     # lifecycle
     end_date_taper_days: float = 7.0
     reduce_only_hours: float = 24.0

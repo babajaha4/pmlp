@@ -67,6 +67,25 @@ def test_trending_from_flow_and_vol():
     assert m.decide(_inp(vol_ratio=3.0), p) == Regime.TRENDING
 
 
+def test_trending_uses_hysteresis_before_returning_to_quiet():
+    p = StrategyProfile(
+        trend_flow_z=2.0,
+        trend_vol_ratio=2.0,
+        trend_exit_frac=0.8,
+    )
+    m = RegimeMachine()
+
+    assert m.decide(_inp(vol_ratio=2.01), p) == Regime.TRENDING
+    assert m.decide(_inp(vol_ratio=1.99), p) == Regime.TRENDING
+    assert m.decide(_inp(vol_ratio=1.81), p) == Regime.TRENDING
+    assert m.decide(_inp(vol_ratio=1.79), p) == Regime.QUIET
+
+    assert m.decide(_inp(flow_z=2.01), p) == Regime.TRENDING
+    assert m.decide(_inp(flow_z=1.99), p) == Regime.TRENDING
+    assert m.decide(_inp(flow_z=1.61), p) == Regime.TRENDING
+    assert m.decide(_inp(flow_z=1.59), p) == Regime.QUIET
+
+
 def test_event_beats_reduce_only_and_trending():
     p = StrategyProfile()
     m = RegimeMachine()
