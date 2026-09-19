@@ -248,6 +248,53 @@ def test_buy_batch_is_scaled_to_remaining_headroom(tmp_path, meta) -> None:
     store.close()
 
 
+def test_target_reservation_replaces_only_current_market_orders(tmp_path, meta) -> None:
+    store = StateStore(tmp_path / "state.db")
+    rm = RiskManager(RiskConfig(
+        max_market_notional_usdc=100,
+        max_total_exposure_usdc=10,
+        max_event_group_loss_usdc=100,
+    ), store)
+    store.upsert_order(
+        OpenOrder("current", meta.yes.token_id, Side.BUY, 0.5, 8, OrderState.LIVE)
+    )
+    store.upsert_order(
+        OpenOrder("other", "other-token", Side.BUY, 0.5, 8, OrderState.LIVE)
+    )
+
+    fitted = rm.fit_target_reservation(
+        meta,
+        [Quote(meta.no.token_id, Side.BUY, 0.5, 20)],
+        event_group_cost=0.0,
+    )
+
+    assert len(fitted) == 1
+    assert fitted[0].size == pytest.approx(12.0)
+    store.close()
+
+
+def test_target_reservation_keeps_sibling_event_orders_reserved(tmp_path, meta) -> None:
+    store = StateStore(tmp_path / "state.db")
+    rm = RiskManager(RiskConfig(
+        max_market_notional_usdc=100,
+        max_total_exposure_usdc=100,
+        max_event_group_loss_usdc=10,
+    ), store)
+    store.upsert_order(
+        OpenOrder("current", meta.yes.token_id, Side.BUY, 0.5, 8, OrderState.LIVE)
+    )
+    # event_group_cost includes this market's $4 plus a sibling market's $4.
+    fitted = rm.fit_target_reservation(
+        meta,
+        [Quote(meta.no.token_id, Side.BUY, 0.5, 20)],
+        event_group_cost=8.0,
+    )
+
+    assert len(fitted) == 1
+    assert fitted[0].size == pytest.approx(12.0)
+    store.close()
+
+
 def test_global_reservation_counts_orders_without_positions(tmp_path, meta) -> None:
     store = StateStore(tmp_path / "state.db")
     rm = RiskManager(RiskConfig(

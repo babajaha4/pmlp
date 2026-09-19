@@ -337,7 +337,9 @@ class JournalBacktester:
             if profile.q_max_usdc > 0 else 0.0
         )
         decision = self.risk.evaluate(
-            meta, ws_stale=False, event_group_cost=self._event_group_cost(meta)
+            meta,
+            ws_stale=False,
+            event_group_cost=self._event_group_cost(meta, include_orders=False),
         )
         regime = self.regimes[cid].decide(
             RegimeInputs(
@@ -385,8 +387,12 @@ class JournalBacktester:
         live = [order for order in self.state.orders.values() if order.token_id in {
             meta.yes.token_id, meta.no.token_id
         }]
+        fitted_quotes = self.risk.fit_target_reservation(
+            meta, list(target.quotes), event_group_cost=self._event_group_cost(meta)
+        )
+        fitted_target = TargetQuotes(target.condition_id, target.regime, tuple(fitted_quotes))
         plan = reconcile(
-            target,
+            fitted_target,
             live,
             tick=meta.tick_size,
             reprice_ticks=profile.reprice_ticks,
@@ -395,10 +401,7 @@ class JournalBacktester:
         for order_id in plan.to_cancel:
             self.queued.pop(order_id, None)
             self.state.remove_order(order_id)
-        quotes = self.risk.fit_reservation(
-            meta, plan.to_place, event_group_cost=self._event_group_cost(meta)
-        )
-        for quote in quotes:
+        for quote in plan.to_place:
             self._order_sequence += 1
             order = OpenOrder(
                 f"replay-{self._order_sequence}", quote.token_id, quote.side,
@@ -534,14 +537,19 @@ class JournalBacktester:
             if len(fractions) == 2:
                 self.rewards += meta.rewards_daily_rate * dt / 86_400.0 * min(fractions)
 
-    def _event_group_cost(self, meta: MarketMeta) -> float:
+    def _event_group_cost(self, meta: MarketMeta, *, include_orders: bool = True) -> float:
         if not meta.event_id:
             return 0.0
         return sum(
             self.state.position(token).size * self.marks.get(
                 token, self.state.position(token).avg_price or 0.5
-            ) + sum(
-                order.notional for order in self.state.orders_for(token) if order.side is Side.BUY
+            ) + (
+                sum(
+                    order.notional
+                    for order in self.state.orders_for(token)
+                    if order.side is Side.BUY
+                )
+                if include_orders else 0.0
             )
             for sibling in self.metas.values()
             if sibling.event_id == meta.event_id

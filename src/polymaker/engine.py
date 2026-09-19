@@ -23,7 +23,7 @@ from polymaker.alerts import Alerter
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
-from polymaker.domain import Fill, MarketMeta, Regime, Side, TradeState
+from polymaker.domain import Fill, MarketMeta, Regime, Side, TargetQuotes, TradeState
 from polymaker.execution.gateway import ExecutionGateway, GatewayReadError
 from polymaker.execution.reconciler import reconcile
 from polymaker.journal import Journal
@@ -707,8 +707,11 @@ class Engine:
                 critical=hb_blind,
             )
 
-        rd = self.risk.evaluate(meta, ws_stale=blind,
-                                event_group_cost=self._event_group_cost(meta))
+        rd = self.risk.evaluate(
+            meta,
+            ws_stale=blind,
+            event_group_cost=self._event_group_cost(meta, include_orders=False),
+        )
         if rd.halt and rd.reason not in ("ws_stale",):
             self.alerter.alert(
                 f"risk_halt:{rd.reason}", f"risk halt: {rd.reason}",
@@ -739,80 +742,85 @@ class Engine:
             ),
         ))
 
-        live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
-        plan = reconcile(tq, live, tick=meta.tick_size,
-                         reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
-        if plan.is_noop:
-            self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
-            return
-
-        if plan.to_cancel:
-            ok = await self.gateway.cancel(plan.to_cancel)
-            if ok:
-                for oid in plan.to_cancel:
-                    self.state.remove_order(oid)
-            else:
-                # cancel MAY have partially applied server-side — keep our view,
-                # resync from REST, and skip placing this cycle (avoid doubles)
-                try:
-                    await self._refresh_token_orders(meta, grace_s=10.0)
-                except GatewayReadError as exc:
-                    self._state_unknown = True
-                    self.alerter.alert("state_unknown", str(exc), critical=True)
-                    log.critical("state_unknown_after_cancel_failure", err=str(exc))
-                self._dirty[cid].set()
+        raw_quotes = list(tq.quotes)
+        async with self._reservation_lock:
+            fitted_quotes = self.risk.fit_target_reservation(
+                meta, raw_quotes, event_group_cost=self._event_group_cost(meta)
+            )
+            fitted_target = TargetQuotes(tq.condition_id, tq.regime, tuple(fitted_quotes))
+            live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
+            plan = reconcile(fitted_target, live, tick=meta.tick_size,
+                             reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
+            if plan.is_noop:
+                self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
                 return
-        placed_n = 0
-        if plan.to_place:
-            async with self._reservation_lock:
+
+            reservation_changed = len(fitted_quotes) != len(raw_quotes) or any(
+                fitted != raw
+                for fitted, raw in zip(fitted_quotes, raw_quotes, strict=False)
+            )
+            if reservation_changed:
+                raw_buys = sum(quote.side is Side.BUY for quote in raw_quotes)
+                fitted_buys = sum(quote.side is Side.BUY for quote in fitted_quotes)
+                if raw_buys and not fitted_buys:
+                    log.warning("risk_reservation_rejected", cid=cid[:8], n=raw_buys)
+                else:
+                    log.info("risk_reservation_scaled", cid=cid[:8],
+                             requested=len(raw_quotes), fitted=len(fitted_quotes))
+
+            if plan.to_cancel:
+                ok = await self.gateway.cancel(plan.to_cancel)
+                if ok:
+                    for oid in plan.to_cancel:
+                        self.state.remove_order(oid)
+                else:
+                    # cancel MAY have partially applied server-side — keep our view,
+                    # resync from REST, and skip placing this cycle (avoid doubles)
+                    try:
+                        await self._refresh_token_orders(meta, grace_s=10.0)
+                    except GatewayReadError as exc:
+                        self._state_unknown = True
+                        self.alerter.alert("state_unknown", str(exc), critical=True)
+                        log.critical("state_unknown_after_cancel_failure", err=str(exc))
+                    self._dirty[cid].set()
+                    return
+            placed_n = 0
+            if plan.to_place:
                 if not self._placement_allowed(cid, epoch):
                     return
-                fitted = self.risk.fit_reservation(
-                    meta, plan.to_place, event_group_cost=self._event_group_cost(meta)
+                # LOAD SHED: under rate-budget pressure, skip *new* quotes in calm
+                # regimes (cancels/exits above already ran) so we don't inject latency
+                # right when the book is busy. Risk regimes always place.
+                shed = (
+                    not self.paper
+                    and self.gateway.order_pressure > 0.85
+                    and regime in (Regime.QUIET, Regime.TRENDING)
                 )
-                if not fitted:
-                    log.warning("risk_reservation_rejected", cid=cid[:8], n=len(plan.to_place))
-                    plan = type(plan)(to_cancel=plan.to_cancel, to_place=[])
+                if shed:
+                    log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
+                    self._dirty[cid].set()  # retry soon
                 else:
-                    if len(fitted) != len(plan.to_place) or any(
-                        a.size != b.size for a, b in zip(fitted, plan.to_place, strict=False)
-                    ):
-                        log.info("risk_reservation_scaled", cid=cid[:8],
-                                 requested=len(plan.to_place), fitted=len(fitted))
-                    plan = type(plan)(to_cancel=plan.to_cancel, to_place=fitted)
-                    # LOAD SHED: under rate-budget pressure, skip *new* quotes in calm
-                    # regimes (cancels/exits above already ran) so we don't inject latency
-                    # right when the book is busy. Risk regimes always place.
-                    shed = (
-                        not self.paper
-                        and self.gateway.order_pressure > 0.85
-                        and regime in (Regime.QUIET, Regime.TRENDING)
-                    )
-                    if shed:
-                        log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
-                        self._dirty[cid].set()  # retry soon
-                    else:
-                        async with self._placement_lock:
-                            if not self._placement_allowed(cid, epoch):
-                                return
-                            placed = await self.gateway.place(
-                                plan.to_place, meta,
-                                can_place=lambda: self._placement_allowed(cid, epoch),
-                            )
-                            placed_n = len(placed)
-                            for o in placed:
-                                self.state.upsert_order(o)
-                            valid = self._placement_allowed(cid, epoch)
-                            if valid:
-                                self.risk.note_order_result(len(placed) == len(plan.to_place))
-                        if not valid:
-                            await self._quarantine(meta, reason="placement_invalidated")
+                    async with self._placement_lock:
+                        if not self._placement_allowed(cid, epoch):
                             return
-                        if len(placed) < len(plan.to_place):
-                            # QUARANTINE: a failed/partial batch may still have posted
-                            # orders we don't have ids for. Cancel everything on these
-                            # tokens (idempotent) and resync — never risk an untracked order.
-                            await self._quarantine(meta, reason="place_incomplete")
+                        placed = await self.gateway.place(
+                            plan.to_place, meta,
+                            can_place=lambda: self._placement_allowed(cid, epoch),
+                        )
+                        placed_n = len(placed)
+                        for o in placed:
+                            self.state.upsert_order(o)
+                        valid = self._placement_allowed(cid, epoch)
+                        if valid:
+                            self.risk.note_order_result(len(placed) == len(plan.to_place))
+                    if not valid:
+                        await self._quarantine(meta, reason="placement_invalidated")
+                        return
+                    if len(placed) < len(plan.to_place):
+                        # QUARANTINE: a failed/partial batch may still have posted
+                        # orders we don't have ids for. Cancel everything on these
+                        # tokens (idempotent) and resync — never risk an untracked order.
+                        await self._quarantine(meta, reason="place_incomplete")
         self._last_quote_fv[cid] = fv
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),
@@ -1113,7 +1121,7 @@ class Engine:
     def _cid_of_token(self, token_id: str) -> str | None:
         return self._token_cid.get(token_id)
 
-    def _event_group_cost(self, meta: MarketMeta) -> float:
+    def _event_group_cost(self, meta: MarketMeta, *, include_orders: bool = True) -> float:
         if not meta.event_id:
             return 0.0
         cost = 0.0
@@ -1121,9 +1129,10 @@ class Engine:
             if m.event_id == meta.event_id:
                 for tok in (m.yes.token_id, m.no.token_id):
                     cost += self.risk.marked_position_notional(tok)
-                    cost += sum(
-                        o.notional for o in self.state.orders_for(tok) if o.side is Side.BUY
-                    )
+                    if include_orders:
+                        cost += sum(
+                            o.notional for o in self.state.orders_for(tok) if o.side is Side.BUY
+                        )
         return cost
 
 

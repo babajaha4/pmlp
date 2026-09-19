@@ -214,15 +214,18 @@ class RiskManager:
         if ws_stale:
             return RiskDecision(True, False, 0.0, "ws_stale")
 
-        market_notional = self._market_notional(meta)
-        total_exposure = self._total_exposure()
+        position_market_notional = self._position_market_notional(meta)
+        position_total_exposure = self._position_total_exposure()
 
-        # hard caps -> reduce only
-        if market_notional >= self._cfg.max_market_notional_usdc:
+        # Filled inventory at a hard cap is reduce-only. Resting BUYs remain hard
+        # reservations, but `fit_target_reservation` can resize or remove them;
+        # treating them as filled inventory would cancel a correctly fitted quote
+        # set on every subsequent recompute.
+        if position_market_notional >= self._cfg.max_market_notional_usdc:
             return RiskDecision(False, True, 1.0, "market_cap")
         if event_group_cost >= self._cfg.max_event_group_loss_usdc:
             return RiskDecision(False, True, 1.0, "event_group_cap")
-        if total_exposure >= self._cfg.max_total_exposure_usdc:
+        if position_total_exposure >= self._cfg.max_total_exposure_usdc:
             return RiskDecision(False, True, 1.0, "total_exposure_cap")
 
         # soft scaling: taper size as any cap is approached (worst-binding wins)
@@ -293,14 +296,46 @@ class RiskManager:
         self, meta: MarketMeta, quotes: list[Quote], *, event_group_cost: float = 0.0
     ) -> list[Quote]:
         """Shrink pending BUY quotes to fit every cap; SELL quotes are unchanged."""
-        buy_notional = sum(q.price * q.size for q in quotes if q.side is Side.BUY)
-        if buy_notional <= 0:
-            return quotes
         headroom = max(0.0, min(
             self._cfg.max_market_notional_usdc - self._market_notional(meta),
             self._cfg.max_total_exposure_usdc - self._total_exposure(),
             self._cfg.max_event_group_loss_usdc - event_group_cost,
         ))
+        return self._fit_to_headroom(meta, quotes, headroom)
+
+    def fit_target_reservation(
+        self, meta: MarketMeta, quotes: list[Quote], *, event_group_cost: float = 0.0
+    ) -> list[Quote]:
+        """Fit a complete desired quote set as a replacement for this market.
+
+        Existing BUYs in the same market are part of the state being replaced,
+        not additional exposure. Reservations in every other market remain in
+        each applicable cap. Computing this final target before reconciliation
+        makes a headroom-scaled order stable on the next identical recompute.
+        """
+        current_market_buys = sum(
+            order.notional
+            for token_id in (meta.yes.token_id, meta.no.token_id)
+            for order in self._store.orders_for(token_id)
+            if order.side is Side.BUY
+        )
+        headroom = max(0.0, min(
+            self._cfg.max_market_notional_usdc
+            - max(0.0, self._market_notional(meta) - current_market_buys),
+            self._cfg.max_total_exposure_usdc
+            - max(0.0, self._total_exposure() - current_market_buys),
+            self._cfg.max_event_group_loss_usdc
+            - max(0.0, event_group_cost - current_market_buys),
+        ))
+        return self._fit_to_headroom(meta, quotes, headroom)
+
+    @staticmethod
+    def _fit_to_headroom(
+        meta: MarketMeta, quotes: list[Quote], headroom: float
+    ) -> list[Quote]:
+        buy_notional = sum(q.price * q.size for q in quotes if q.side is Side.BUY)
+        if buy_notional <= 0:
+            return quotes
         scale = min(1.0, headroom / buy_notional)
         fitted: list[Quote] = []
         for quote in quotes:

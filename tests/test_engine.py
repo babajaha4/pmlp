@@ -68,6 +68,31 @@ async def test_recompute_is_idempotent_within_tolerance(tmp_path, meta):
     eng.catalog.close()
 
 
+async def test_risk_fitted_quotes_are_stable_across_recomputes(tmp_path, meta):
+    """A quote shrunk to remaining headroom must not cancel/replace itself."""
+    eng = _engine_with_market(tmp_path, meta)
+    eng.cfg.risk.max_total_exposure_usdc = 10.0
+    _feed_book(eng, meta)
+
+    await eng._recompute(meta.condition_id)
+    first_orders = {
+        order.order_id: (order.token_id, order.side, order.price, order.size)
+        for order in eng.state.orders.values()
+    }
+    assert first_orders
+    assert sum(order.notional for order in eng.state.orders.values()) <= 10.0 + 1e-9
+
+    await eng._recompute(meta.condition_id)
+
+    second_orders = {
+        order.order_id: (order.token_id, order.side, order.price, order.size)
+        for order in eng.state.orders.values()
+    }
+    assert second_orders == first_orders
+    eng.state.close()
+    eng.catalog.close()
+
+
 async def test_recompute_skips_when_book_empty(tmp_path, meta):
     eng = _engine_with_market(tmp_path, meta)
     # no book fed

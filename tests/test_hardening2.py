@@ -585,10 +585,12 @@ def test_open_orders_are_hard_reservations_without_taper_churn(tmp_path, meta):
     d = rm.evaluate(meta, ws_stale=False, event_group_cost=0.0)
     assert not d.reduce_only
     assert d.size_scale == 1.0  # resting orders do not taper -> no churn
-    # but FILLED inventory near cap DOES taper
+    # but FILLED inventory near cap DOES taper without treating replaceable
+    # resting orders as another copy of the desired target
     store.apply_fill(Fill(meta.yes.token_id, Side.BUY, 0.2, 70, "f"))  # $14 position
     d2 = rm.evaluate(meta, ws_stale=False, event_group_cost=0.0)
-    assert d2.reduce_only and d2.reason == "market_cap"
+    assert not d2.reduce_only
+    assert 0.0 < d2.size_scale < 1.0
     store.close()
 
 
