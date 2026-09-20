@@ -72,6 +72,7 @@ class QuoteInputs:
     no_exit_urgency: float = 0.0
     yes_fill_cooldown: bool = False
     no_fill_cooldown: bool = False
+    entry_enabled: bool = True
 
 
 def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
@@ -113,11 +114,15 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
 
     soft_cap = p.q_soft_frac  # fraction of q_max at which the adding side pulls
     add_yes = (
+        inp.entry_enabled
+        and
         inp.regime not in (Regime.REDUCE_ONLY,)
         and u < soft_cap
         and not inp.yes_fill_cooldown
     )
     add_no = (
+        inp.entry_enabled
+        and
         inp.regime not in (Regime.REDUCE_ONLY,)
         and u > -soft_cap
         and not inp.no_fill_cooldown
@@ -133,7 +138,8 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
                         p.layers, p.layer_step_ticks, down=True,
-                        exchange_min=m.min_order_size, reward_floor=reward_floor)
+                        exchange_min=m.min_order_size, reward_floor=reward_floor,
+                        require_reward_floor=p.reward_only_entries)
 
     # entry: BUY NO
     if add_no:
@@ -146,7 +152,8 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
                         p.layers, p.layer_step_ticks, down=True,
-                        exchange_min=m.min_order_size, reward_floor=reward_floor)
+                        exchange_min=m.min_order_size, reward_floor=reward_floor,
+                        require_reward_floor=p.reward_only_entries)
 
     # ── exits: SELL held inventory (maker, never cross) ─────────────────
     _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, inp.yes_view, tick, dec,
@@ -242,6 +249,7 @@ def _add_layers(
     quotes: list[Quote], token_id: str, side: Side, top_price: float, tick: float, dec: int,
     total_size: float, layers: int, step_ticks: int, *, down: bool,
     exchange_min: float = 0.0, reward_floor: float = 0.0,
+    require_reward_floor: bool = False,
 ) -> None:
     """Split size across `layers` price levels stepping away from the touch.
 
@@ -263,6 +271,8 @@ def _add_layers(
         per = round(total_size / layers, 2)
     if reward_floor > 0 and 0.5 * reward_floor <= per < reward_floor:
         per = reward_floor  # bump each order up to scoring size
+    if require_reward_floor and reward_floor > 0 and per < reward_floor:
+        return
     if per < exchange_min or per <= 0:
         return
     for i in range(layers):

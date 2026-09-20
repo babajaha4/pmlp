@@ -215,7 +215,7 @@ const parameterLabels = {
   base_size_usdc: "基础订单额", inventory_cap_usdc: "策略库存上限", inventory_soft_fraction: "Soft cap 比例",
   layers: "报价层数", minimum_edge_ticks: "最小边际", minimum_half_spread_ticks: "最小半价差",
   inventory_skew_gamma: "库存偏斜 Gamma", volatility_spread_weight: "波动扩点权重", toxicity_spread_weight: "毒性扩点权重",
-  reward_aware_placement: "奖励带报价", reward_target_ratio: "奖励带目标比例",
+  reward_aware_placement: "奖励带报价", reward_only_entries: "仅奖励市场新增买入", reward_target_ratio: "奖励带目标比例",
   anti_sniping_enabled: "反狙击保护", anti_sniping_pause_seconds: "跳变暂停",
   anti_sniping_stable_confirm_seconds: "稳定确认", fill_cooldown_seconds: "成交冷却",
   max_reprice_ticks_per_update: "单次最大追价",
@@ -227,7 +227,7 @@ function parameterValue(key, value) {
   if (["event_cooloff_seconds", "exit_urgency_seconds", "anti_sniping_pause_seconds", "anti_sniping_stable_confirm_seconds", "fill_cooldown_seconds"].includes(key)) return `${number(value, 1)} 秒`;
   if (["minimum_edge_ticks", "minimum_half_spread_ticks"].includes(key)) return `${number(value, 0)} ticks`;
   if (key === "inventory_soft_fraction" || key === "trend_size_multiplier" || key === "reward_target_ratio") return `${number(value * 100, 0)}%`;
-  if (["reward_aware_placement", "anti_sniping_enabled"].includes(key)) return value ? "启用" : "停用";
+  if (["reward_aware_placement", "reward_only_entries", "anti_sniping_enabled"].includes(key)) return value ? "启用" : "停用";
   if (key === "max_reprice_ticks_per_update") return `${number(value, 0)} ticks`;
   return number(value, 2);
 }

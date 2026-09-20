@@ -141,6 +141,7 @@ class StrategyProfile(BaseModel):
     # opt-in at the model default; live profiles enable them explicitly so
     # paper/backtest fixtures retain the legacy deterministic behavior.
     reward_aware_placement: bool = False
+    reward_only_entries: bool = False
     reward_target_ratio: float = Field(default=0.5, gt=0.0, le=1.0)
     reward_min_candidate_levels: int = Field(default=3, ge=1)
     anti_sniping_enabled: bool = False

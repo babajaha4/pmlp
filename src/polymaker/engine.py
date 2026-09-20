@@ -49,6 +49,7 @@ from polymaker.strategy.quoting import (
     construct_quotes,
 )
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
+from polymaker.strategy.rewards import reward_entry_markets
 from polymaker.userstream.client import UserStream
 from polymaker.userstream.parse import normalize_trade
 
@@ -104,6 +105,8 @@ class Engine:
         self._placement_epoch = 0
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
+        self._reward_entry_cids: frozenset[str] = frozenset()
+        self._reward_entry_warning_emitted = False
         # supervised tasks: name -> (factory, task) so a dead task restarts
         self._task_specs: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
@@ -775,12 +778,22 @@ class Engine:
                 and p.fill_cooldown_s > 0
                 and now - no_last_fill < p.fill_cooldown_s
             ),
+            entry_enabled=(
+                not p.reward_only_entries or cid in self._reward_entry_cids
+            ),
         ))
 
         raw_quotes = list(tq.quotes)
         async with self._reservation_lock:
             fitted_quotes = self.risk.fit_target_reservation(
-                meta, raw_quotes, event_group_cost=self._event_group_cost(meta)
+                meta,
+                raw_quotes,
+                event_group_cost=self._event_group_cost(meta),
+                reward_min_size=(
+                    meta.rewards_min_size * p.reward_size_mult
+                    if p.reward_only_entries and cid in self._reward_entry_cids
+                    else None
+                ),
             )
             fitted_target = TargetQuotes(tq.condition_id, tq.regime, tuple(fitted_quotes))
             live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
@@ -1087,6 +1100,34 @@ class Engine:
                 continue
             self._halted.discard(cid)
             self._apply_meta_refresh(cid, raw)
+        self._refresh_reward_entry_allocation()
+
+    def _refresh_reward_entry_allocation(self) -> None:
+        previous = self._reward_entry_cids
+        self._reward_entry_cids = reward_entry_markets(
+            ((meta, self.profiles[cid]) for cid, meta in self.metas.items()),
+            max_total_notional=self.cfg.risk.max_total_exposure_usdc,
+            max_market_notional=self.cfg.risk.max_market_notional_usdc,
+            max_event_notional=self.cfg.risk.max_event_group_loss_usdc,
+        )
+        if self._reward_entry_cids != previous:
+            log.info(
+                "reward_entry_allocation_changed",
+                selected=len(self._reward_entry_cids),
+                cids=sorted(cid[:8] for cid in self._reward_entry_cids),
+            )
+            self._wake_all()
+        if self._reward_entry_cids:
+            self._reward_entry_warning_emitted = False
+        elif (
+            any(p.reward_only_entries for p in self.profiles.values())
+            and not self._reward_entry_warning_emitted
+        ):
+            log.warning(
+                "reward_entry_unavailable",
+                reason="no configured reward market fits current reservation caps",
+            )
+            self._reward_entry_warning_emitted = True
 
     def _apply_meta_refresh(self, cid: str, raw: dict[str, Any]) -> None:
         import dataclasses

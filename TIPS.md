@@ -44,6 +44,12 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
    Below-min orders earn **zero** — easy to miss. `rewardsMinSize` also *changes*
    (we saw 50→100 live); a stale catalog value silently mis-sizes you. Let the
    engine refresh metadata from Gamma at startup, and rescan periodically.
+   In the live profile, `reward_only_entries = true` now makes this a hard
+   entry rule: zero-reward markets and markets whose minimum size cannot fit
+   the configured market, event, and total reservation caps receive no new
+   BUYs. Existing inventory remains eligible for maker-only SELL exits. If risk
+   scaling would push a reward order below its floor, the whole order is
+   omitted; a posted order is not proof that it qualifies for rewards.
 3. **False regime signals on quiet markets.** Two we hit and fixed:
    - *False HALT*: staleness measured "time since last book update," so a quiet
      market halted itself into zero rewards. Gate on the **WS connection** liveness

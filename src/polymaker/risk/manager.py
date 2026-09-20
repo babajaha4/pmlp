@@ -293,7 +293,8 @@ class RiskManager:
         )
 
     def fit_reservation(
-        self, meta: MarketMeta, quotes: list[Quote], *, event_group_cost: float = 0.0
+        self, meta: MarketMeta, quotes: list[Quote], *, event_group_cost: float = 0.0,
+        reward_min_size: float | None = None,
     ) -> list[Quote]:
         """Shrink pending BUY quotes to fit every cap; SELL quotes are unchanged."""
         headroom = max(0.0, min(
@@ -301,10 +302,11 @@ class RiskManager:
             self._cfg.max_total_exposure_usdc - self._total_exposure(),
             self._cfg.max_event_group_loss_usdc - event_group_cost,
         ))
-        return self._fit_to_headroom(meta, quotes, headroom)
+        return self._fit_to_headroom(meta, quotes, headroom, reward_min_size=reward_min_size)
 
     def fit_target_reservation(
-        self, meta: MarketMeta, quotes: list[Quote], *, event_group_cost: float = 0.0
+        self, meta: MarketMeta, quotes: list[Quote], *, event_group_cost: float = 0.0,
+        reward_min_size: float | None = None,
     ) -> list[Quote]:
         """Fit a complete desired quote set as a replacement for this market.
 
@@ -327,11 +329,12 @@ class RiskManager:
             self._cfg.max_event_group_loss_usdc
             - max(0.0, event_group_cost - current_market_buys),
         ))
-        return self._fit_to_headroom(meta, quotes, headroom)
+        return self._fit_to_headroom(meta, quotes, headroom, reward_min_size=reward_min_size)
 
     @staticmethod
     def _fit_to_headroom(
-        meta: MarketMeta, quotes: list[Quote], headroom: float
+        meta: MarketMeta, quotes: list[Quote], headroom: float,
+        *, reward_min_size: float | None = None,
     ) -> list[Quote]:
         buy_notional = sum(q.price * q.size for q in quotes if q.side is Side.BUY)
         if buy_notional <= 0:
@@ -343,7 +346,8 @@ class RiskManager:
                 fitted.append(quote)
                 continue
             size = quote.size * scale
-            if size + 1e-9 >= meta.min_order_size:
+            floor = max(meta.min_order_size, reward_min_size or 0.0)
+            if size + 1e-9 >= floor:
                 fitted.append(Quote(quote.token_id, quote.side, quote.price, size))
         return fitted
 

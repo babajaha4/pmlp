@@ -17,6 +17,7 @@ reprice_ticks       = 2
 resize_frac         = 0.2
 min_edge_ticks      = 1
 reward_aware_placement       = true
+reward_only_entries          = true
 reward_target_ratio          = 0.5
 reward_min_candidate_levels  = 3
 anti_sniping_enabled         = true

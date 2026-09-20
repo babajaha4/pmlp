@@ -256,6 +256,7 @@ def _strategy_payload(
                 "volatility_spread_weight": profile.c_vol,
                 "toxicity_spread_weight": profile.c_tox,
                 "reward_aware_placement": profile.reward_aware_placement,
+                "reward_only_entries": profile.reward_only_entries,
                 "reward_target_ratio": profile.reward_target_ratio,
                 "anti_sniping_enabled": profile.anti_sniping_enabled,
                 "anti_sniping_pause_seconds": profile.anti_sniping_pause_s,

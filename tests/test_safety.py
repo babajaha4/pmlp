@@ -319,6 +319,37 @@ def test_global_reservation_counts_orders_without_positions(tmp_path, meta) -> N
     store.close()
 
 
+def test_reward_floor_rejects_scaled_order_below_scoring_minimum(tmp_path, meta) -> None:
+    store = StateStore(tmp_path / "state.db")
+    rm = RiskManager(RiskConfig(
+        max_market_notional_usdc=10,
+        max_total_exposure_usdc=10,
+        max_event_group_loss_usdc=10,
+    ), store)
+    fitted = rm.fit_reservation(
+        meta,
+        [Quote(meta.yes.token_id, Side.BUY, 0.5, 20)],
+        reward_min_size=25,
+    )
+    assert fitted == []
+    store.close()
+
+
+def test_non_reward_order_keeps_existing_headroom_scaling(tmp_path, meta) -> None:
+    store = StateStore(tmp_path / "state.db")
+    rm = RiskManager(RiskConfig(
+        max_market_notional_usdc=10,
+        max_total_exposure_usdc=10,
+        max_event_group_loss_usdc=10,
+    ), store)
+    fitted = rm.fit_reservation(
+        meta,
+        [Quote(meta.yes.token_id, Side.BUY, 0.5, 20)],
+    )
+    assert fitted[0].size == pytest.approx(20.0)
+    store.close()
+
+
 def test_merge_is_disabled_by_default() -> None:
     assert Merger(Config()).can_merge is False
 

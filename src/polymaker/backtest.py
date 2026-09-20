@@ -388,7 +388,13 @@ class JournalBacktester:
             meta.yes.token_id, meta.no.token_id
         }]
         fitted_quotes = self.risk.fit_target_reservation(
-            meta, list(target.quotes), event_group_cost=self._event_group_cost(meta)
+            meta,
+            list(target.quotes),
+            event_group_cost=self._event_group_cost(meta),
+            reward_min_size=(
+                meta.rewards_min_size * profile.reward_size_mult
+                if profile.reward_only_entries else None
+            ),
         )
         fitted_target = TargetQuotes(target.condition_id, target.regime, tuple(fitted_quotes))
         plan = reconcile(

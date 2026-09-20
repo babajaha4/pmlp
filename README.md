@@ -147,6 +147,12 @@ from the reference LP tool:
   short period, while maker-only exits remain available.
 - `max_reprice_ticks_per_update` limits how far a resting order can chase a
   single update. Risk reservations and post-only checks still run afterwards.
+- `reward_only_entries` makes reward metadata an entry gate: a market with zero
+  reward rate, zero reward band, or a reward minimum that cannot fit the active
+  reservation caps receives no new BUY orders. Existing inventory can still
+  leave through maker-only SELL orders. A risk-scaled order is dropped rather
+  than left below `rewardsMinSize`, because an order that is posted but below
+  the reward floor does not earn the intended incentive.
 
 These settings are per-profile in `config/strategy.toml` and are surfaced in
 the local control panel. They do not change wallet identity, order signing,
@@ -248,8 +254,10 @@ Maker-only, quoting both sides of each market as USDC-collateralized bids:
   off), `REDUCE_ONLY` (inventory cap / near end date → exits only), `HALTED`
   (stale data / resolved / kill switch → cancel all).
 - **Rewards + rebates** — quotes stay inside the liquidity-rewards band in QUIET;
-  the market selector also scores the new maker-rebate program (a share of taker
-  fees rebated to makers).
+  reward-only live profiles allocate scarce reservation headroom by reward per
+  dollar and skip markets whose minimum qualifying size exceeds the configured
+  market/event caps. The market selector also scores the new maker-rebate
+  program (a share of taker fees rebated to makers).
 - **Risk** — per-market notional cap, neg-risk event-group worst-case cap, total
   exposure cap, daily-loss kill switch, WS-staleness halt.
 

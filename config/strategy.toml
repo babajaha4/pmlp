@@ -29,6 +29,7 @@ min_edge_ticks      = 1       # never bid above FV - 1 tick
 # Reward-aware placement: use actual resting levels inside the scoring band;
 # anti-sniping: filter midpoint jumps, pause, require stability, and cap chase.
 reward_aware_placement      = true
+reward_only_entries         = false
 reward_target_ratio         = 0.5
 reward_min_candidate_levels = 3
 anti_sniping_enabled        = true

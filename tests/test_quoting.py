@@ -256,3 +256,24 @@ def test_fill_cooldown_suppresses_new_buy_on_filled_token(meta, profile):
     tq = construct_quotes(_inputs(meta, profile, yes_fill_cooldown=True))
     assert not [q for q in tq.quotes if q.token_id == "yes-token" and q.side is Side.BUY]
     assert [q for q in tq.quotes if q.token_id == "no-token" and q.side is Side.BUY]
+
+
+def test_entry_disabled_keeps_inventory_exits_but_removes_buys(meta, profile):
+    tq = construct_quotes(_inputs(
+        meta,
+        profile,
+        entry_enabled=False,
+        pos_yes=Position("yes-token", 20, 0.4),
+    ))
+    assert not [q for q in tq.quotes if q.side is Side.BUY]
+    assert [q for q in tq.quotes if q.side is Side.SELL and q.token_id == "yes-token"]
+
+
+def test_reward_only_entry_drops_orders_below_reward_floor(meta, profile):
+    reward_profile = profile.model_copy(update={
+        "reward_only_entries": True,
+        "base_size_usdc": 0.5,
+        "layers": 1,
+    })
+    tq = construct_quotes(_inputs(meta, reward_profile))
+    assert not [q for q in tq.quotes if q.side is Side.BUY]
