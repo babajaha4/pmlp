@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import AsyncMock
 
 from polymaker.config import Config, PathsConfig, StrategyProfile
 from polymaker.domain import Side
@@ -100,3 +101,17 @@ async def test_recompute_skips_when_book_empty(tmp_path, meta):
     assert len(eng.state.orders) == 0
     eng.state.close()
     eng.catalog.close()
+
+
+async def test_shutdown_closes_streams_and_is_idempotent(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.md.close = AsyncMock()
+    eng.user = AsyncMock()
+    eng.gateway.cancel_asset = AsyncMock(return_value=True)
+
+    await eng.shutdown()
+    await eng.shutdown()
+
+    eng.md.close.assert_awaited_once()
+    eng.user.close.assert_awaited_once()
+    assert eng.gateway.cancel_asset.await_count == 2

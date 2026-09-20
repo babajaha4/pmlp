@@ -118,6 +118,7 @@ class Engine:
         self._hb_was_down = False
         self._state_unknown = False  # authoritative REST snapshot is unavailable
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
+        self._shutdown_started = False
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -188,18 +189,25 @@ class Engine:
             await asyncio.gather(*self._tasks.values(), *self._aux_tasks)
 
     async def shutdown(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
         self._running = False
         log.info("engine_shutdown")
-        self.md.stop()
+        await self.md.close()
         if self.user:
-            self.user.stop()
-        for t in [*self._tasks.values(), *self._aux_tasks]:
+            await self.user.close()
+        tasks = [*self._tasks.values(), *self._aux_tasks]
+        for t in tasks:
             t.cancel()
+        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
         await self._cancel_managed_assets()
         self.gateway.close()
         self.journal.close()
         self.state.close()
         self.catalog.close()
+        log.info("engine_shutdown_complete")
 
     # ── market resolution ───────────────────────────────────────────────
     async def _resolve_markets(self) -> None:

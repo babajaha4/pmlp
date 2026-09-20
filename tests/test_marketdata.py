@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from polymaker.domain import Side
 from polymaker.marketdata.parse import (
     parse_book,
@@ -108,3 +110,13 @@ def test_service_forwards_trades_for_flow():
     svc.set_markets([("0xcond", ["yes-tok"])])
     svc._dispatch(LAST_TRADE)
     assert len(trades) == 1 and trades[0].aggressor is Side.BUY
+
+
+async def test_service_close_closes_active_socket() -> None:
+    svc = MarketDataService()
+    socket = AsyncMock()
+    svc._ws = socket
+    await svc.close()
+    socket.close.assert_awaited_once()
+    assert svc._stop.is_set()
+    assert svc._ws is None

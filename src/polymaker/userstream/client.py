@@ -7,6 +7,7 @@ updates into the StateStore via the UserEventProcessor. Reconnects with backoff.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -47,6 +48,7 @@ class UserStream:
         self._on_reconnect = on_reconnect or (lambda: None)
         self._markets: list[str] = []
         self._stop = asyncio.Event()
+        self._ws: Any = None
         # Connection health. ping_timeout guarantees a dead link flips
         # `connected` to False within ~15s, so the engine can go blind-safe.
         self.connected: bool = False
@@ -85,6 +87,7 @@ class UserStream:
         if self._proxy:
             kwargs["proxy"] = self._proxy
         async with websockets.connect(self._url, **kwargs) as ws:
+            self._ws = ws
             await ws.send(json.dumps(sub))
             self.connected = True
             is_reconnect = self._ever_connected
@@ -100,9 +103,19 @@ class UserStream:
             finally:
                 self.connected = False
                 self.disconnected_since = time.time()
+                self._ws = None
 
     def stop(self) -> None:
         self._stop.set()
+
+    async def close(self) -> None:
+        """Stop the loop and close an active authenticated socket."""
+        self.stop()
+        ws = self._ws
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        self._ws = None
 
     def _handle(self, raw: str | bytes) -> None:
         try:

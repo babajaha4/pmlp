@@ -12,6 +12,7 @@ automatically because the server sends a fresh `book` on (re)subscribe.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -131,6 +132,15 @@ class MarketDataService:
 
     def stop(self) -> None:
         self._stop.set()
+
+    async def close(self) -> None:
+        """Stop the loop and close an active socket before teardown."""
+        self.stop()
+        ws = self._ws
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        self._ws = None
 
     # ── message handling ────────────────────────────────────────────────
     def _handle(self, raw: str | bytes) -> None:
