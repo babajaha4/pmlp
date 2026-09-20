@@ -272,7 +272,10 @@ def _add_layers(
     if reward_floor > 0 and 0.5 * reward_floor <= per < reward_floor:
         per = reward_floor  # bump each order up to scoring size
     if require_reward_floor and reward_floor > 0 and per < reward_floor:
-        return
+        # Reward-only entries are sized to the scoring floor even when the
+        # profile's base USDC size is smaller. RiskManager will still reject
+        # the quote if the resulting notional cannot fit the active caps.
+        per = reward_floor
     if per < exchange_min or per <= 0:
         return
     for i in range(layers):

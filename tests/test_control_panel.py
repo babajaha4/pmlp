@@ -108,6 +108,7 @@ def test_service_actions_are_scoped_and_never_use_dangerous_trading_commands(tmp
     else:
         assert "systemd-run" in command
         assert "KillSignal=SIGINT" in command
+        assert "TimeoutStopSec=45s" in command
 
 
 @pytest.mark.parametrize(("stopped", "expected"), [(False, "1"), (True, "0")])

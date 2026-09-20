@@ -19,8 +19,8 @@ loop = "uvloop"
 
 [risk]
 max_total_exposure_usdc = 60.0       # phase-one hard ceiling on deployed capital
-max_event_group_loss_usdc = 30.0
-max_market_notional_usdc = 15.0      # per-market cap
+max_event_group_loss_usdc = 55.0     # 50-share reward floor + small buffer
+max_market_notional_usdc = 55.0      # per-market cap; fits current 50-share rewards
 daily_loss_kill_usdc = 12.0          # stop trading at ~$12 mark-to-market loss
 ws_stale_halt_s = 8.0
 user_ws_blind_halt_s = 12.0

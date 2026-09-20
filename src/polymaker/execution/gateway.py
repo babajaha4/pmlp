@@ -125,7 +125,13 @@ class ExecutionGateway:
                 signature_type=self._cfg.wallet.signature_type,
                 funder=sec.browser_address,
             )
-            creds = client.create_or_derive_api_key()
+            # Existing wallets already have deterministic L2 credentials. Derive
+            # first to avoid a noisy/expected 400 from create_api_key; retain a
+            # create fallback for a brand-new wallet.
+            try:
+                creds = client.derive_api_key()
+            except Exception:
+                creds = client.create_api_key()
             client.set_api_creds(creds)
             return client, creds, client.get_address()
 

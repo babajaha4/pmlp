@@ -3,12 +3,12 @@ from __future__ import annotations
 from polymaker.config import Config
 
 
-def test_phase_one_live_config_preserves_safety_limits_and_small_quotes() -> None:
+def test_live_config_fits_current_reward_floor_without_changing_total_cap() -> None:
     cfg = Config.load("livecfg", load_env=False)
 
     assert cfg.risk.max_total_exposure_usdc == 60.0
-    assert cfg.risk.max_event_group_loss_usdc == 30.0
-    assert cfg.risk.max_market_notional_usdc == 15.0
+    assert cfg.risk.max_event_group_loss_usdc == 55.0
+    assert cfg.risk.max_market_notional_usdc == 55.0
     assert cfg.risk.daily_loss_kill_usdc == 12.0
     assert cfg.execution.post_only is True
     assert cfg.merge.enabled is False
@@ -30,3 +30,4 @@ def test_phase_one_live_config_preserves_safety_limits_and_small_quotes() -> Non
     assert profile.base_size_usdc == 5.0
     assert profile.q_max_usdc == 12.0
     assert profile.layers == 1
+    assert profile.reward_only_entries is True

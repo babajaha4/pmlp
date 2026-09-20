@@ -61,6 +61,7 @@ _TRADE_SYNC_OVERLAP_S = 300
 _TRADE_SYNC_PENDING = "confirmed_trade_pending"
 _TRADE_SYNC_REQUIRE_PROOF = "confirmed_trade_requires_proof"
 _TRADE_SYNC_PENDING_MAX_AGE_S = 7 * 86400
+_CANCEL_ASSET_TIMEOUT_S = 15.0
 
 
 def _utc_day_start_ts(now: float | None = None) -> int:
@@ -492,18 +493,24 @@ class Engine:
         # Invalidate waiters before waiting for an already-submitted placement.
         # Cancellation never acquires market or reservation locks.
         self._placement_epoch += 1
-        ok = True
+        unique_tokens = list(dict.fromkeys(tokens))
+
+        async def cancel_one(tok: str) -> bool:
+            try:
+                cancelled = await asyncio.wait_for(
+                    self.gateway.cancel_asset(tok), timeout=_CANCEL_ASSET_TIMEOUT_S,
+                )
+                if cancelled:
+                    for order in self.state.orders_for(tok):
+                        self.state.remove_order(order.order_id)
+                return cancelled
+            except Exception as exc:  # noqa: BLE001
+                log.critical("managed_cancel_failed", token=tok[:12], err=str(exc))
+                return False
+
         async with self._placement_lock:
-            for tok in tokens:
-                try:
-                    cancelled = await self.gateway.cancel_asset(tok)
-                    ok = cancelled and ok
-                    if cancelled:
-                        for order in self.state.orders_for(tok):
-                            self.state.remove_order(order.order_id)
-                except Exception as exc:  # noqa: BLE001
-                    ok = False
-                    log.critical("managed_cancel_failed", token=tok[:12], err=str(exc))
+            results = await asyncio.gather(*(cancel_one(tok) for tok in unique_tokens))
+        ok = all(results)
         if not ok:
             self._state_unknown = True
             self.alerter.alert("managed_cancel_failed",

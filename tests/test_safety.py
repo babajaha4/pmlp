@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from types import SimpleNamespace
 
@@ -396,6 +397,30 @@ async def test_engine_cancels_only_managed_tokens(tmp_path, meta) -> None:
     eng.gateway.cancel_asset = cancel  # type: ignore[method-assign]
     assert await eng._cancel_managed_assets() is True
     assert set(seen) == {meta.yes.token_id, meta.no.token_id}
+    eng.state.close()
+    eng.catalog.close()
+
+
+@pytest.mark.asyncio
+async def test_managed_cancel_timeout_fails_closed_without_serial_wait(tmp_path, meta, monkeypatch) -> None:
+    cfg = Config(
+        paths=PathsConfig(
+            db=str(tmp_path / "state.db"),
+            journal_dir=str(tmp_path / "journal"),
+            log_dir=str(tmp_path / "logs"),
+        )
+    )
+    eng = Engine(cfg, paper=True)
+    eng.metas[meta.condition_id] = meta
+    monkeypatch.setattr("polymaker.engine._CANCEL_ASSET_TIMEOUT_S", 0.01)
+
+    async def hang(_token: str) -> bool:
+        await asyncio.sleep(1)
+        return True
+
+    eng.gateway.cancel_asset = hang  # type: ignore[method-assign]
+    assert await eng._cancel_managed_assets() is False
+    assert eng._state_unknown is True
     eng.state.close()
     eng.catalog.close()
 

@@ -160,6 +160,7 @@ class BitviseControl:
         launch = (
             f"sudo systemd-run --unit={unit} --property=Restart=on-failure "
             f"--property=KillSignal=SIGINT --property=User=ubuntu "
+            f"--property=TimeoutStopSec=45s "
             f"--working-directory={root} --no-block {binary} run "
             f"--config-dir {config} --live --confirm-live"
         )

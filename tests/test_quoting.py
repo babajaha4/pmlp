@@ -269,11 +269,13 @@ def test_entry_disabled_keeps_inventory_exits_but_removes_buys(meta, profile):
     assert [q for q in tq.quotes if q.side is Side.SELL and q.token_id == "yes-token"]
 
 
-def test_reward_only_entry_drops_orders_below_reward_floor(meta, profile):
+def test_reward_only_entry_raises_small_profile_to_reward_floor(meta, profile):
     reward_profile = profile.model_copy(update={
         "reward_only_entries": True,
         "base_size_usdc": 0.5,
         "layers": 1,
     })
     tq = construct_quotes(_inputs(meta, reward_profile))
-    assert not [q for q in tq.quotes if q.side is Side.BUY]
+    buys = [q for q in tq.quotes if q.side is Side.BUY]
+    assert buys
+    assert all(q.size >= meta.rewards_min_size for q in buys)
