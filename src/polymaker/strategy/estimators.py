@@ -14,6 +14,88 @@ from dataclasses import dataclass
 from polymaker.domain import Side
 
 
+@dataclass(frozen=True, slots=True)
+class MidpointObservation:
+    """Filtered midpoint plus the anti-sniping state for one update."""
+
+    value: float
+    jumped: bool
+    paused: bool
+    stable: bool
+
+
+class MidpointGuard:
+    """EMA/median midpoint filter with a bounded post-jump pause.
+
+    The guard is intentionally pure state: it never decides whether an order
+    is safe to submit. The regime machine consumes ``paused``/``stable`` and
+    remains responsible for pulling quotes. This keeps the risk and execution
+    gates unchanged.
+    """
+
+    __slots__ = ("_ema", "_recent", "_last_raw", "_pause_until", "_stable_since")
+
+    def __init__(self) -> None:
+        self._ema: float | None = None
+        self._recent: list[float] = []
+        self._last_raw: float | None = None
+        self._pause_until = 0.0
+        self._stable_since: float | None = None
+
+    def update(
+        self,
+        raw_mid: float,
+        now: float,
+        *,
+        tick: float,
+        jump_ticks: int,
+        pause_s: float,
+        stable_confirm_s: float,
+        ema_alpha: float,
+        median_window: int,
+    ) -> MidpointObservation:
+        if not math.isfinite(raw_mid) or not math.isfinite(now):
+            raise ValueError("midpoint and timestamp must be finite")
+        alpha = min(max(float(ema_alpha), 0.01), 1.0)
+        window = min(max(int(median_window), 1), 31)
+        previous_ema = self._ema if self._ema is not None else raw_mid
+        # Compare a new observation with the previous raw observation. Using
+        # the slowly moving EMA here would retrigger the pause on every tick
+        # while a large jump remains at its new level.
+        jumped = (
+            self._last_raw is not None
+            and abs(raw_mid - self._last_raw) >= max(1, jump_ticks) * max(tick, 1e-12)
+        )
+        self._ema = alpha * raw_mid + (1.0 - alpha) * previous_ema
+        self._recent.append(raw_mid)
+        if len(self._recent) > window:
+            del self._recent[: len(self._recent) - window]
+        ordered = sorted(self._recent)
+        median = ordered[len(ordered) // 2]
+        filtered = 0.5 * self._ema + 0.5 * median
+
+        if jumped:
+            self._pause_until = max(self._pause_until, now + max(0.0, pause_s))
+            self._stable_since = None
+        elif (
+            self._stable_since is None
+            or (
+                self._last_raw is not None
+                and abs(raw_mid - self._last_raw) > max(tick, 1e-12)
+            )
+        ):
+            self._stable_since = now
+        self._last_raw = raw_mid
+
+        paused = now < self._pause_until
+        stable = (
+            not paused
+            and self._stable_since is not None
+            and now - self._stable_since >= max(0.0, stable_confirm_s)
+        )
+        return MidpointObservation(filtered, jumped, paused, stable)
+
+
 class Ewma:
     """Time-decayed exponentially weighted mean.
 

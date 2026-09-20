@@ -31,6 +31,8 @@ class RegimeInputs:
     ws_stale: bool = False
     risk_halt: bool = False
     risk_reduce_only: bool = False
+    anti_sniping_pause: bool = False
+    anti_sniping_unstable: bool = False
 
 
 class RegimeMachine:
@@ -53,6 +55,17 @@ class RegimeMachine:
         jump_ticks = abs(inp.fv - inp.prev_fv) / inp.tick if inp.prev_fv is not None else 0.0
         if inp.sweep_flagged or jump_ticks >= p.event_jump_ticks:
             self._event_until = inp.now + p.event_cooloff_s
+            return Regime.EVENT
+        if inp.anti_sniping_pause or inp.anti_sniping_unstable:
+            # The anti-sniping overlay has its own short pause/stability
+            # horizon. Do not turn an EMA/median warm-up into the full market
+            # event cool-off, which is reserved for a confirmed sweep/jump.
+            overlay_until = inp.now + (
+                p.anti_sniping_pause_s if inp.anti_sniping_pause
+                else p.anti_sniping_stable_confirm_s
+            )
+            if self._event_until <= inp.now:
+                self._event_until = overlay_until
             return Regime.EVENT
         if inp.now < self._event_until:
             return Regime.EVENT

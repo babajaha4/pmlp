@@ -137,6 +137,20 @@ class StrategyProfile(BaseModel):
     reprice_ticks: int = 2
     resize_frac: float = 0.15
     min_edge_ticks: int = 1
+    # Reward-aware placement and anti-sniping overlays. These are deliberately
+    # opt-in at the model default; live profiles enable them explicitly so
+    # paper/backtest fixtures retain the legacy deterministic behavior.
+    reward_aware_placement: bool = False
+    reward_target_ratio: float = Field(default=0.5, gt=0.0, le=1.0)
+    reward_min_candidate_levels: int = Field(default=3, ge=1)
+    anti_sniping_enabled: bool = False
+    anti_sniping_ema_alpha: float = Field(default=0.35, gt=0.0, le=1.0)
+    anti_sniping_median_window: int = Field(default=5, ge=1, le=31)
+    anti_sniping_mid_jump_ticks: int = Field(default=8, ge=1)
+    anti_sniping_pause_s: float = Field(default=2.0, ge=0.0)
+    anti_sniping_stable_confirm_s: float = Field(default=1.0, ge=0.0)
+    fill_cooldown_s: float = Field(default=2.0, ge=0.0)
+    max_reprice_ticks_per_update: int = Field(default=0, ge=0)
     # regime
     event_cooloff_s: float = 60.0
     event_jump_ticks: int = 8

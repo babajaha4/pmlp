@@ -356,6 +356,17 @@ def test_reconcile_reprices_when_far():
     assert len(plan.to_place) == 1
 
 
+def test_reconcile_caps_single_update_chase_distance():
+    tq = TargetQuotes("cid", Regime.QUIET, (Quote("tok", Side.BUY, 0.40, 100),))
+    live = [_live("o1", "tok", Side.BUY, 0.49, 100)]
+    plan = reconcile(
+        tq, live, tick=0.01, reprice_ticks=2, resize_frac=0.15,
+        max_reprice_ticks=3,
+    )
+    assert plan.to_cancel == ["o1"]
+    assert plan.to_place[0].price == 0.46
+
+
 def test_reconcile_resizes_when_size_drifts():
     tq = TargetQuotes("cid", Regime.QUIET, (Quote("tok", Side.BUY, 0.49, 100),))
     live = [_live("o1", "tok", Side.BUY, 0.49, 50)]  # 50% smaller > 15%

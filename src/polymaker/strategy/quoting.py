@@ -70,6 +70,8 @@ class QuoteInputs:
     risk_size_scale: float = 1.0  # RiskManager may throttle size in [0,1]
     yes_exit_urgency: float = 0.0  # [0,1]; engine raises with hold time / adverse drift
     no_exit_urgency: float = 0.0
+    yes_fill_cooldown: bool = False
+    no_fill_cooldown: bool = False
 
 
 def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
@@ -110,12 +112,23 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     common_scale = regime_scale * tox_scale * _clamp(inp.risk_size_scale, 0.0, 1.0)
 
     soft_cap = p.q_soft_frac  # fraction of q_max at which the adding side pulls
-    add_yes = inp.regime not in (Regime.REDUCE_ONLY,) and u < soft_cap
-    add_no = inp.regime not in (Regime.REDUCE_ONLY,) and u > -soft_cap
+    add_yes = (
+        inp.regime not in (Regime.REDUCE_ONLY,)
+        and u < soft_cap
+        and not inp.yes_fill_cooldown
+    )
+    add_no = (
+        inp.regime not in (Regime.REDUCE_ONLY,)
+        and u > -soft_cap
+        and not inp.no_fill_cooldown
+    )
 
     # entry: BUY YES
     if add_yes:
-        price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
+        price = _place_bid(
+            yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks,
+            fair_value=inp.fv, half_band=delta, profile=p,
+        )
         if price is not None:
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
@@ -125,7 +138,10 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     # entry: BUY NO
     if add_no:
         no_fv = 1.0 - inp.fv
-        price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
+        price = _place_bid(
+            no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks,
+            fair_value=no_fv, half_band=delta, profile=p,
+        )
         if price is not None:
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
@@ -149,14 +165,36 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _place_bid(
-    target: float, view: BookView, tick: float, dec: int, fv: float, min_edge_ticks: int
+    target: float,
+    view: BookView,
+    tick: float,
+    dec: int,
+    fv: float,
+    min_edge_ticks: int,
+    *,
+    fair_value: float,
+    half_band: float,
+    profile: StrategyProfile,
 ) -> float | None:
-    """Position a BUY: join the touch or sit behind, never cross, keep min edge vs FV."""
+    """Position a BUY while preserving maker-only and fair-value guards.
+
+    When enabled and the view contains L2 levels, fine-tick markets target the
+    middle of the reward half-band. Coarse-tick markets select a resting level
+    that is second-farthest from mid (or the middle of three), matching the
+    proven reward policy. Missing/insufficient depth falls back to the existing
+    target so a temporary sparse snapshot cannot create a new quote failure.
+    """
     price = target
+    reward_selected = False
+    if profile.reward_aware_placement:
+        reward_price = _reward_band_price(view, tick, half_band, profile)
+        if reward_price is not None:
+            price = reward_price
+            reward_selected = True
     # never bid above (FV - min_edge*tick): we don't pay through fair value
-    price = min(price, fv - min_edge_ticks * tick)
+    price = min(price, fair_value - min_edge_ticks * tick)
     # join the queue rather than jump it (conservative maker default)
-    if view.best_bid is not None and price >= view.best_bid:
+    if not reward_selected and view.best_bid is not None and price >= view.best_bid:
         price = view.best_bid
     # never cross the ask
     if view.best_ask is not None and price >= view.best_ask:
@@ -165,6 +203,32 @@ def _place_bid(
     if p <= 0 or p >= 1:
         return None
     return p
+
+
+def _reward_band_price(
+    view: BookView, tick: float, half_band: float, profile: StrategyProfile,
+) -> float | None:
+    """Return a reward-band target from positive-depth L2 levels."""
+    if not view.bid_levels or view.mid is None:
+        return None
+    mid = view.mid
+    band = max(float(half_band), tick)
+    coarse = math.isclose(tick, 0.01, abs_tol=1e-9) or math.isclose(tick, 1.0, abs_tol=1e-6)
+    if coarse:
+        used = max(tick, math.floor(band / tick + _EPS) * tick)
+        candidates = sorted({
+            round(level.price, 12)
+            for level in view.bid_levels
+            if level.size > 0 and mid - used - _EPS <= level.price <= mid + _EPS
+        }, key=lambda value: (abs(value - mid), -value))
+        if len(candidates) < profile.reward_min_candidate_levels:
+            return None
+        if len(candidates) == 3:
+            return candidates[1]
+        return candidates[-2]  # second-farthest after near-to-far ordering
+    # Fine ticks use a stable fractional location within the reward half-band.
+    ratio = _clamp(profile.reward_target_ratio, 0.01, 1.0)
+    return round_to_tick(mid - ratio * band, tick, 12, up=False)
 
 
 def _size_shares(base_usdc: float, price: float, scale: float, m: MarketMeta) -> float:

@@ -9,7 +9,7 @@ No I/O — the gateway executes the returned plan.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from polymaker.domain import OpenOrder, Quote, TargetQuotes
 
@@ -33,6 +33,7 @@ def reconcile(
     tick: float,
     reprice_ticks: int,
     resize_frac: float,
+    max_reprice_ticks: int = 0,
 ) -> ReconcilePlan:
     """Diff targets against live orders. Keep live orders that already satisfy a
     target within tolerance; cancel the rest; place targets with no match."""
@@ -44,8 +45,20 @@ def reconcile(
     to_place: list[Quote] = []
     price_tol = reprice_ticks * tick + _EPS
 
+    used_anchors: set[str] = set()
     for q in targets.quotes:
         candidates = live_by_key.get((q.token_id, q.side.value), [])
+        if max_reprice_ticks > 0 and candidates:
+            available = [o for o in candidates if o.order_id not in used_anchors]
+            if available:
+                anchor = min(available, key=lambda o: abs(o.price - q.price))
+                used_anchors.add(anchor.order_id)
+                max_move = max(1, int(max_reprice_ticks)) * tick
+                if abs(q.price - anchor.price) > max_move + _EPS:
+                    direction = 1.0 if q.price > anchor.price else -1.0
+                    steps = round((anchor.price + direction * max_move) / tick)
+                    bounded = max(tick, min(1.0 - tick, steps * tick))
+                    q = replace(q, price=bounded)
         match: OpenOrder | None = None
         for o in candidates:
             if o.order_id in keep:

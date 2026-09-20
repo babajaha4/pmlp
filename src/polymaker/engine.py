@@ -39,6 +39,7 @@ from polymaker.strategy.estimators import (
     FlowEstimator,
     MarketEstimators,
     MarkoutTracker,
+    MidpointGuard,
     VolEstimator,
 )
 from polymaker.strategy.quoting import (
@@ -91,6 +92,7 @@ class Engine:
         self.metas: dict[str, MarketMeta] = {}
         self.profiles: dict[str, StrategyProfile] = {}
         self.est: dict[str, MarketEstimators] = {}
+        self._mid_guards: dict[str, MidpointGuard] = {}
         self.regime_m: dict[str, RegimeMachine] = {}
         self._dirty: dict[str, asyncio.Event] = {}
         self._sweep: dict[str, bool] = {}
@@ -213,6 +215,7 @@ class Engine:
                 self.metas[meta.condition_id] = meta
                 self.profiles[meta.condition_id] = self.cfg.profile_for(entry)
                 self.est[meta.condition_id] = self._make_estimators(self.profiles[meta.condition_id])
+                self._mid_guards[meta.condition_id] = MidpointGuard()
                 self.regime_m[meta.condition_id] = RegimeMachine()
                 self._dirty[meta.condition_id] = asyncio.Event()
                 self._locks[meta.condition_id] = asyncio.Lock()
@@ -660,7 +663,25 @@ class Engine:
             return
         est = self.est[cid]
         est.flow.decay_to(now)
-        fv = compute_fair_value(micro, est.flow.z, meta.tick_size)
+        raw_fv = compute_fair_value(micro, est.flow.z, meta.tick_size)
+        fv = raw_fv
+        anti_pause = False
+        anti_unstable = False
+        if p.anti_sniping_enabled:
+            guard = self._mid_guards.setdefault(cid, MidpointGuard())
+            observation = guard.update(
+                raw_fv,
+                now,
+                tick=meta.tick_size,
+                jump_ticks=p.anti_sniping_mid_jump_ticks,
+                pause_s=p.anti_sniping_pause_s,
+                stable_confirm_s=p.anti_sniping_stable_confirm_s,
+                ema_alpha=p.anti_sniping_ema_alpha,
+                median_window=p.anti_sniping_median_window,
+            )
+            fv = observation.value
+            anti_pause = observation.paused
+            anti_unstable = not observation.stable
         prev_fv = est.last_fv
         est.on_fair_value(fv, now)
 
@@ -724,10 +745,14 @@ class Engine:
                 vol_ratio=est.vol.ratio, flow_z=est.flow.z, inventory_util=inv_util,
                 hours_to_end=hours_to_end, sweep_flagged=self._sweep.pop(cid, False),
                 ws_stale=ws_stale, risk_halt=rd.halt, risk_reduce_only=rd.reduce_only,
+                anti_sniping_pause=anti_pause,
+                anti_sniping_unstable=anti_unstable,
             ),
             p,
         )
 
+        yes_last_fill = self.state.last_fill_ts(meta.yes.token_id)
+        no_last_fill = self.state.last_fill_ts(meta.no.token_id)
         tq = construct_quotes(QuoteInputs(
             meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
             toxicity=est.markout.toxicity, yes_view=yes_book.view(),
@@ -735,10 +760,20 @@ class Engine:
             pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
             risk_size_scale=rd.size_scale,
             yes_exit_urgency=compute_exit_urgency(
-                self.state.last_fill_ts(meta.yes.token_id), now, p.exit_urgency_s,
+                yes_last_fill, now, p.exit_urgency_s,
             ),
             no_exit_urgency=compute_exit_urgency(
-                self.state.last_fill_ts(meta.no.token_id), now, p.exit_urgency_s,
+                no_last_fill, now, p.exit_urgency_s,
+            ),
+            yes_fill_cooldown=(
+                yes_last_fill is not None
+                and p.fill_cooldown_s > 0
+                and now - yes_last_fill < p.fill_cooldown_s
+            ),
+            no_fill_cooldown=(
+                no_last_fill is not None
+                and p.fill_cooldown_s > 0
+                and now - no_last_fill < p.fill_cooldown_s
             ),
         ))
 
@@ -750,7 +785,8 @@ class Engine:
             fitted_target = TargetQuotes(tq.condition_id, tq.regime, tuple(fitted_quotes))
             live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
             plan = reconcile(fitted_target, live, tick=meta.tick_size,
-                             reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
+                             reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac,
+                             max_reprice_ticks=p.max_reprice_ticks_per_update)
             if plan.is_noop:
                 self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
                 return

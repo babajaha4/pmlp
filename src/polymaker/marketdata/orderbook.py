@@ -36,6 +36,10 @@ class BookView:
     second_ask: float | None
     bid_depth: float  # summed size within band, bid side
     ask_depth: float  # summed size within band, ask side
+    # Positive-depth levels are included so the pure quoter can choose a
+    # reward-band price without reaching back into the mutable OrderBook.
+    bid_levels: tuple[BookLevel, ...] = ()
+    ask_levels: tuple[BookLevel, ...] = ()
 
     @property
     def mid(self) -> float | None:
@@ -181,6 +185,8 @@ class OrderBook:
             second_ask=sa.price if sa else None,
             bid_depth=bid_depth,
             ask_depth=ask_depth,
+            bid_levels=tuple(BookLevel(price, size) for price, size in reversed(self.bids.items())),
+            ask_levels=tuple(BookLevel(price, size) for price, size in self.asks.items()),
         )
 
     # ── internals ───────────────────────────────────────────────────────

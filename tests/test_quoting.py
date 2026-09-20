@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from polymaker.domain import Position, Regime, Side
+from polymaker.marketdata.orderbook import BookLevel, BookView
 from polymaker.strategy.quoting import (
     QuoteInputs,
     compute_exit_urgency,
@@ -204,3 +207,52 @@ def test_quiet_regime_clamps_spread_to_reward_band(meta, profile):
     top_yes = max(q.price for q in tq.quotes if q.token_id == "yes-token" and q.side == Side.BUY)
     # bid should be within (band + a tick of rounding) of FV
     assert top_yes >= 0.50 - band - meta.tick_size
+
+
+def test_reward_aware_fine_placement_targets_middle_of_band(meta, profile):
+    meta = replace(meta, tick_size=0.001)
+    levels = tuple(BookLevel(price, 100.0) for price in (0.49, 0.488, 0.486))
+    reward_view = BookView(
+        best_bid=0.49, best_bid_size=100.0,
+        best_ask=0.51, best_ask_size=100.0,
+        second_bid=0.488, second_ask=0.512,
+        bid_depth=300.0, ask_depth=300.0,
+        bid_levels=levels,
+        ask_levels=tuple(BookLevel(price, 100.0) for price in (0.51, 0.512)),
+    )
+    p = profile.model_copy(update={"reward_aware_placement": True})
+    tq = construct_quotes(_inputs(meta, p, yes_view=reward_view, no_view=reward_view))
+    yes = [q for q in tq.quotes if q.token_id == "yes-token" and q.side is Side.BUY]
+    assert yes
+    # delta=2 ticks and reward ratio=.5 => 0.499, without joining the old
+    # 0.49 touch. The min-edge guard still applies before submission.
+    assert max(q.price for q in yes) == pytest.approx(0.499)
+
+
+def test_reward_aware_coarse_placement_uses_second_farthest_level(meta, profile):
+    coarse_meta = replace(meta, tick_size=0.01)
+    levels = tuple(BookLevel(price, 100.0) for price in (0.49, 0.48, 0.47, 0.46))
+    reward_view = BookView(
+        best_bid=0.49, best_bid_size=100.0,
+        best_ask=0.51, best_ask_size=100.0,
+        second_bid=0.48, second_ask=0.52,
+        bid_depth=400.0, ask_depth=400.0,
+        bid_levels=levels,
+        ask_levels=tuple(BookLevel(price, 100.0) for price in (0.51, 0.52)),
+    )
+    p = profile.model_copy(update={
+        "reward_aware_placement": True,
+        "delta_min_ticks": 5,
+        "layers": 1,
+    })
+    tq = construct_quotes(_inputs(coarse_meta, p, yes_view=reward_view, no_view=reward_view))
+    yes = [q for q in tq.quotes if q.token_id == "yes-token" and q.side is Side.BUY]
+    assert yes
+    # Candidates are near-to-far [0.49, .48, .47, .46]; choose .47.
+    assert max(q.price for q in yes) == pytest.approx(0.47)
+
+
+def test_fill_cooldown_suppresses_new_buy_on_filled_token(meta, profile):
+    tq = construct_quotes(_inputs(meta, profile, yes_fill_cooldown=True))
+    assert not [q for q in tq.quotes if q.token_id == "yes-token" and q.side is Side.BUY]
+    assert [q for q in tq.quotes if q.token_id == "no-token" and q.side is Side.BUY]

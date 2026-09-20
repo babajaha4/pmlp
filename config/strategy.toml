@@ -26,6 +26,19 @@ layer_step_ticks    = 2
 reprice_ticks       = 2       # ignore 1-tick FV flicker (hold queue position)
 resize_frac         = 0.2
 min_edge_ticks      = 1       # never bid above FV - 1 tick
+# Reward-aware placement: use actual resting levels inside the scoring band;
+# anti-sniping: filter midpoint jumps, pause, require stability, and cap chase.
+reward_aware_placement      = true
+reward_target_ratio         = 0.5
+reward_min_candidate_levels = 3
+anti_sniping_enabled        = true
+anti_sniping_ema_alpha      = 0.35
+anti_sniping_median_window  = 5
+anti_sniping_mid_jump_ticks = 6
+anti_sniping_pause_s        = 3
+anti_sniping_stable_confirm_s = 2
+fill_cooldown_s             = 3
+max_reprice_ticks_per_update = 4
 # --- regime (damped for a quiet tape: one 250-share print must not flap us) ---
 event_cooloff_s     = 30      # shorter: this is a deep, slow market
 event_jump_ticks    = 6       # 0.006 = ~3% jump -> pull quotes
@@ -69,6 +82,17 @@ layer_step_ticks    = 2
 reprice_ticks       = 3       # ignore <=3-tick FV jitter (hold queue position)
 resize_frac         = 0.6     # don't cancel/replace on a regime size-flip (154<->77)
 min_edge_ticks      = 1
+reward_aware_placement      = true
+reward_target_ratio         = 0.5
+reward_min_candidate_levels = 3
+anti_sniping_enabled        = true
+anti_sniping_ema_alpha      = 0.35
+anti_sniping_median_window  = 5
+anti_sniping_mid_jump_ticks = 5
+anti_sniping_pause_s        = 3
+anti_sniping_stable_confirm_s = 2
+fill_cooldown_s             = 3
+max_reprice_ticks_per_update = 3
 # --- regime: rest through noise (high trend threshold) but pull HARD on a real
 #     sweep/jump, since the gapped book makes a toxic fill costly ---
 event_cooloff_s     = 30

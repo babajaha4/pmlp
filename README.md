@@ -130,6 +130,28 @@ one fresh LIVE process. `Start` recreates the transient unit with
 the wallet-wide `cancel-all`, clears a kill state, changes strategy parameters,
 or bypasses startup reconciliation.
 
+### Reward-aware and anti-sniping overlays
+
+The production Python engine keeps its existing fail-closed execution and
+ledger path, while live profiles enable two pure-strategy overlays imported
+from the reference LP tool:
+
+- `reward_aware_placement` uses positive-depth levels inside the current
+  liquidity-reward band. Fine ticks target the middle of the band; coarse ticks
+  choose a depth-backed level rather than blindly joining the touch. If the
+  snapshot has insufficient depth, quoting falls back to the existing target.
+- `anti_sniping_enabled` filters fair value with an EMA plus rolling median,
+  pauses after a material midpoint jump, and requires a stable confirmation
+  period before returning from `EVENT`.
+- `fill_cooldown_s` suppresses new BUY quotes for the just-filled token for a
+  short period, while maker-only exits remain available.
+- `max_reprice_ticks_per_update` limits how far a resting order can chase a
+  single update. Risk reservations and post-only checks still run afterwards.
+
+These settings are per-profile in `config/strategy.toml` and are surfaced in
+the local control panel. They do not change wallet identity, order signing,
+managed-token cancellation, or the persistent risk/ledger safeguards.
+
 ### Journal replay assumptions
 
 `backtest` reruns the configured strategy over timestamp-ordered `book`,

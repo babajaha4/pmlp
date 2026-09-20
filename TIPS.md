@@ -55,6 +55,12 @@ so the failure modes below are ones that actually bit us, not hypotheticals.
    seconds → you lose queue position and get sampled out of rewards. Make it
    **sticky**: raise `reprice_ticks`, `resize_frac`, and the trend thresholds.
    Resting > reacting for a reward farmer.
+   The live profiles now also use depth-backed reward-band placement: fine ticks
+   target the band midpoint, while coarse ticks use a depth level away from the
+   touch. Sparse snapshots safely fall back to the normal target.
+   Midpoint EMA/median filtering, jump pauses, stable confirmation, a short
+   post-fill BUY cooldown, and a per-update reprice cap reduce adverse selection
+   without bypassing the existing risk or ledger gates.
 5. **Fine-tick illusion.** On 0.001-tick markets (prices like 19.3¢) per-share
    spread is fractions of a cent — profit is **rewards + rebates**, not spread
    capture. A "+$4 exit" is noise; don't let it set your strategy.

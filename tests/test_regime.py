@@ -91,3 +91,16 @@ def test_event_beats_reduce_only_and_trending():
     m = RegimeMachine()
     r = m.decide(_inp(sweep_flagged=True, inventory_util=1.0, flow_z=5.0), p)
     assert r == Regime.EVENT
+
+
+def test_anti_sniping_overlay_does_not_use_full_event_cooloff():
+    p = StrategyProfile(
+        event_cooloff_s=60.0,
+        anti_sniping_pause_s=3.0,
+        anti_sniping_stable_confirm_s=2.0,
+    )
+    m = RegimeMachine()
+    assert m.decide(_inp(now=1000.0, anti_sniping_unstable=True), p) == Regime.EVENT
+    assert m.decide(_inp(now=1001.0, anti_sniping_unstable=True), p) == Regime.EVENT
+    assert m.cooloff_remaining(1002.5) == 0.0
+    assert m.decide(_inp(now=1002.5), p) == Regime.QUIET
