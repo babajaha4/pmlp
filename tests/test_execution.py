@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 import time
 from types import SimpleNamespace
 
@@ -61,6 +63,37 @@ async def test_paper_gateway_heartbeat_and_cancel_all_noop():
     assert await gw.heartbeat() is True  # paper: healthy no-op
     assert gw.heartbeat_failures == 0
     await gw.cancel_all()  # no client, must not raise
+
+
+async def test_gateway_close_waits_for_cancelled_inflight_io() -> None:
+    """Cancelling the awaiter must not leave a worker alive after close returns."""
+    gateway = ExecutionGateway(Config(), paper=True)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_io() -> None:
+        started.set()
+        release.wait(timeout=2.0)
+        finished.set()
+
+    task = asyncio.create_task(gateway._io(blocking_io))  # noqa: SLF001
+    assert await asyncio.to_thread(started.wait, 1.0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    timer = threading.Timer(0.05, release.set)
+    timer.start()
+    try:
+        gateway.begin_shutdown()
+        gateway.close()
+    finally:
+        timer.cancel()
+        release.set()
+
+    assert finished.is_set()
+    assert gateway.inflight_io == 0
 
 
 def test_gateway_requires_wallet_for_live_connect(monkeypatch):

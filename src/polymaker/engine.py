@@ -204,6 +204,9 @@ class Engine:
         self._shutdown_started = True
         self._running = False
         log.info("engine_shutdown")
+        # Executor work outlives cancellation of the asyncio task awaiting it.
+        # Signal bounded fallback loops before cancelling their awaiters.
+        self.gateway.begin_shutdown()
         await self.md.close()
         if self.user:
             await self.user.close()
@@ -213,6 +216,7 @@ class Engine:
         with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
         await self._cancel_managed_assets()
+        await self.alerter.close()
         self.gateway.close()
         self.journal.close()
         self.state.close()

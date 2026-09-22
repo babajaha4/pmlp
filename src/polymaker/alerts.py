@@ -25,6 +25,8 @@ class Alerter:
         self._min_interval = min_interval_s
         self._proxy = proxy
         self._last_sent: dict[str, float] = {}  # key -> ts (dedupe/rate-limit)
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._closing = False
 
     @property
     def enabled(self) -> bool:
@@ -38,14 +40,27 @@ class Alerter:
         limit). Safe to call from sync code — schedules the POST on the loop.
         """
         (log.critical if critical else log.warning)("alert", key=key, msg=message)
-        if not self._url:
+        if not self._url or self._closing:
             return
         now = time.time()
         if not critical and now - self._last_sent.get(key, 0.0) < self._min_interval:
             return
         self._last_sent[key] = now
         with contextlib.suppress(RuntimeError):  # no running loop (off-loop call)
-            asyncio.get_running_loop().create_task(self._post(key, message, critical))
+            task = asyncio.get_running_loop().create_task(
+                self._post(key, message, critical), name=f"alert:{key}"
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def close(self) -> None:
+        """Cancel and join fire-and-forget webhook requests during shutdown."""
+        self._closing = True
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _post(self, key: str, message: str, critical: bool) -> None:
         text = f"{'🚨' if critical else '⚠️'} polymaker [{key}] {message}"

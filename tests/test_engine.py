@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from polymaker.catalog.rewards import RewardMarketSnapshot, RewardMarketsReadError
 from polymaker.config import Config, PathsConfig, StrategyProfile
@@ -107,9 +107,15 @@ async def test_recompute_skips_when_book_empty(tmp_path, meta):
 
 async def test_shutdown_closes_streams_and_is_idempotent(tmp_path, meta):
     eng = _engine_with_market(tmp_path, meta)
+    lifecycle: list[str] = []
     eng.md.close = AsyncMock()
     eng.user = AsyncMock()
-    eng.gateway.cancel_asset = AsyncMock(return_value=True)
+    eng.gateway.begin_shutdown = Mock(side_effect=lambda: lifecycle.append("begin"))
+    eng.gateway.cancel_asset = AsyncMock(
+        side_effect=lambda _token: lifecycle.append("cancel") or True
+    )
+    eng.gateway.close = Mock(side_effect=lambda: lifecycle.append("close"))
+    eng.alerter.close = AsyncMock(side_effect=lambda: lifecycle.append("alerts"))
 
     await eng.shutdown()
     await eng.shutdown()
@@ -117,6 +123,12 @@ async def test_shutdown_closes_streams_and_is_idempotent(tmp_path, meta):
     eng.md.close.assert_awaited_once()
     eng.user.close.assert_awaited_once()
     assert eng.gateway.cancel_asset.await_count == 2
+    eng.gateway.begin_shutdown.assert_called_once_with()
+    eng.gateway.close.assert_called_once_with()
+    eng.alerter.close.assert_awaited_once_with()
+    assert lifecycle[0] == "begin"
+    assert lifecycle[-2:] == ["alerts", "close"]
+    assert lifecycle.count("cancel") == 2
 
 
 async def test_metadata_refresh_applies_official_reward_competition(

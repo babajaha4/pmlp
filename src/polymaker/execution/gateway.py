@@ -16,9 +16,10 @@ import itertools
 import json
 import math
 import random
+import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import date
 from typing import Any, TypeVar
@@ -78,6 +79,11 @@ class ExecutionGateway:
         # dedicated, bounded pool for blocking order/HTTP calls so a burst of
         # requotes across many markets can't starve the default executor
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="clob-io")
+        self._closing = threading.Event()
+        self._closed = False
+        self._close_lock = threading.Lock()
+        self._inflight: set[Future[Any]] = set()
+        self._inflight_lock = threading.Lock()
 
     @property
     def paper(self) -> bool:
@@ -88,14 +94,46 @@ class ExecutionGateway:
         """0 = plenty of order-post budget, 1 = about to queue (shed load)."""
         return self._order_bucket.pressure
 
+    @property
+    def inflight_io(self) -> int:
+        with self._inflight_lock:
+            return len(self._inflight)
+
+    def begin_shutdown(self) -> None:
+        """Tell long fallback reads to stop after their current bounded attempt."""
+        self._closing.set()
+
     def close(self) -> None:
-        self._data_client.close()
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        """Release all gateway resources after every submitted worker has exited.
+
+        Cancelling an asyncio task does not stop its underlying executor call.
+        Waiting here is therefore required: otherwise Python's non-daemon worker
+        threads can keep the process alive after the engine reports shutdown.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self.begin_shutdown()
+            pending = self.inflight_io
+            if pending:
+                log.info("gateway_io_drain_started", pending=pending)
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._data_client.close()
+            self._closed = True
+            if pending:
+                log.info("gateway_io_drain_complete")
 
     async def _io(self, fn: Callable[..., _T], *args: Any) -> _T:
         """Run a blocking client call on the dedicated pool."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._pool, fn, *args)
+        future = self._pool.submit(fn, *args)
+        with self._inflight_lock:
+            self._inflight.add(future)
+        future.add_done_callback(self._forget_inflight)
+        return await asyncio.wrap_future(future)
+
+    def _forget_inflight(self, future: Future[Any]) -> None:
+        with self._inflight_lock:
+            self._inflight.discard(future)
 
     @property
     def creds(self) -> Any:
@@ -360,6 +398,8 @@ class ExecutionGateway:
                     "inputs": [{"name": "a", "type": "address"}, {"name": "id", "type": "uint256"}],
                     "outputs": [{"name": "", "type": "uint256"}]}]
             for rpc in dict.fromkeys(rpcs):  # dedupe, keep order
+                if self._closing.is_set():
+                    return None
                 try:
                     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
                     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
@@ -401,6 +441,8 @@ class ExecutionGateway:
                     "outputs": [{"name": "", "type": "uint256"}]}]
             funder = None
             for rpc in dict.fromkeys(rpcs):
+                if self._closing.is_set():
+                    return None
                 try:
                     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
                     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
