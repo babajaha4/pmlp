@@ -119,9 +119,19 @@ control token, and an operator confirmation dialog.
 The dashboard shows exchange-authoritative collateral, positions and open
 orders; read-only SQLite fills and risk state; current midpoint MTM; reservation
 headroom; current market regime; and every effective strategy profile. It
-refreshes every 20 seconds by default. Snapshot collection sends a compressed
+refreshes every 60 seconds by default. Snapshot collection sends a compressed
 read-only Python probe through SSH and does not install files or write the VPS
 database.
+
+The dashboard also reads Polymarket's authenticated official rewards endpoints.
+It shows the current UTC day's official liquidity-reward earnings, live reward
+percentage by configured market, and whether each managed order is currently
+scoring. API failures are displayed as unknown rather than zero. Polymarket pays
+rewards daily at midnight UTC directly to the maker/Deposit Wallet; the minimum
+payout is 1 pUSD. It also reads the public official rewards-market catalog and
+shows each configured market's daily pool and `market_competitiveness`. The
+official catalog fields are displayed separately from settled earnings and do
+not change the configured market list or the engine's existing allocation rule.
 
 `Stop` sends `SIGINT`, so normal shutdown cancels only configured-token orders
 before exiting. `Restart` performs that same graceful shutdown and then starts

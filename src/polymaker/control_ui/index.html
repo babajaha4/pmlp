@@ -68,6 +68,11 @@
         <span class="metric-note">UTC 基准</span>
       </article>
       <article class="metric">
+        <span class="metric-label">官方流动性奖励</span>
+        <strong id="officialRewardMetric">--</strong>
+        <span id="officialRewardNote" class="metric-note">读取中</span>
+      </article>
+      <article class="metric">
         <span class="metric-label">最坏情况敞口</span>
         <strong id="exposureMetric">--</strong>
         <span id="exposureNote" class="metric-note">--</span>
@@ -106,7 +111,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>市场</th><th>Regime</th><th>持仓价值</th><th>BUY 预留</th><th>总敞口</th><th>上限使用</th><th>挂单</th></tr></thead>
+            <thead><tr><th>市场</th><th>Regime</th><th>官方日奖池</th><th>官方竞争度</th><th>官方奖励份额</th><th>持仓价值</th><th>BUY 预留</th><th>总敞口</th><th>上限使用</th><th>挂单</th></tr></thead>
             <tbody id="marketRows"></tbody>
           </table>
         </div>
@@ -132,7 +137,7 @@
         <div class="section-heading"><div><span class="section-kicker">Orders</span><h2>权威挂单</h2></div><span id="managedOrdersBadge" class="inline-state"></span></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>市场</th><th>Outcome</th><th>方向</th><th>价格</th><th>剩余数量</th><th>Notional</th><th>管理范围</th></tr></thead>
+            <thead><tr><th>市场</th><th>Outcome</th><th>方向</th><th>价格</th><th>剩余数量</th><th>Notional</th><th>奖励计分</th><th>管理范围</th></tr></thead>
             <tbody id="orderRows"></tbody>
           </table>
         </div>

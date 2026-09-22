@@ -23,7 +23,7 @@ polygon_rpc = "https://polygon-bor-rpc.publicnode.com"
 [engine]
 debounce_ms = 250               # min gap between quote recomputes per market
 quoter_tick_s = 60              # slow baseline refresh (reactions are event-driven); cool-off re-entry is precise
-reconcile_interval_s = 20       # REST drift reconciliation cadence
+reconcile_interval_s = 60       # REST drift reconciliation cadence; avoid Data API 429s
 catalog_refresh_s = 300         # market catalog rescan cadence (15 min)
 heartbeat = true                # exchange dead-man switch
 heartbeat_interval_s = 5

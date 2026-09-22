@@ -27,6 +27,7 @@ def meta() -> MarketMeta:
         fees_enabled=True,
         end_date_iso="2028-11-07T00:00:00Z",
         event_id="evt-1",
+        reward_competitiveness=0.0,
     )
 
 

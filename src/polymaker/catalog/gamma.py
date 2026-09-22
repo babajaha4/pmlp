@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from polymaker.catalog.rewards import fetch_reward_markets
 from polymaker.domain import MarketMeta, TokenMeta
 from polymaker.logging import get_logger
 
@@ -188,28 +189,6 @@ def _json_list(value: Any) -> list[Any]:
 async def fetch_reward_rates(
     clob_host: str = "https://clob.polymarket.com", timeout: float = 20.0
 ) -> dict[str, float]:
-    """Build {condition_id: daily USDC reward rate} from CLOB sampling-markets.
-
-    These are the rewards-enabled markets; the daily rate isn't on Gamma.
-    """
-    usdc = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
-    rates: dict[str, float] = {}
-    async with httpx.AsyncClient(base_url=clob_host.rstrip("/"), timeout=timeout) as client:
-        cursor = ""
-        for _ in range(50):
-            r = await client.get("/sampling-markets", params={"next_cursor": cursor})
-            r.raise_for_status()
-            data = r.json()
-            for m in data.get("data", []):
-                cid = m.get("condition_id")
-                rate = 0.0
-                for ri in (m.get("rewards") or {}).get("rates") or []:
-                    if str(ri.get("asset_address", "")).lower() == usdc:
-                        rate = float(ri.get("rewards_daily_rate", 0) or 0)
-                        break
-                if cid:
-                    rates[cid] = rate
-            cursor = data.get("next_cursor") or ""
-            if not cursor or cursor == "LTE=":  # "LTE=" is the documented end sentinel
-                break
-    return rates
+    """Compatibility view over the authoritative rewards-market snapshot."""
+    snapshots = await fetch_reward_markets(clob_host, timeout)
+    return {condition_id: snapshot.daily_rate for condition_id, snapshot in snapshots.items()}

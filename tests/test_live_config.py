@@ -12,6 +12,7 @@ def test_live_config_fits_current_reward_floor_without_changing_total_cap() -> N
     assert cfg.risk.daily_loss_kill_usdc == 12.0
     assert cfg.execution.post_only is True
     assert cfg.merge.enabled is False
+    assert cfg.engine.reconcile_interval_s == 60.0
 
     markets = cfg.enabled_markets
     assert len(markets) == 6

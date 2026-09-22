@@ -120,7 +120,8 @@ class CatalogStore:
         """
         rows = self.top(limit)
         fields = [
-            "score", "reward_pool_per_day", "rebate_pool_per_day", "spread",
+            "score", "reward_pool_per_day", "reward_competitiveness",
+            "rebate_pool_per_day", "spread",
             "best_bid", "best_ask", "tick", "min_size", "neg_risk", "taker_fee_pct",
             "rebate_pct", "rewards_max_spread", "liquidity", "volume_24h",
             "end_date", "question", "slug", "condition_id",
@@ -130,7 +131,9 @@ class CatalogStore:
             w.writerow(fields)
             for m, sc in rows:
                 w.writerow([
-                    f"{sc.score:.3f}", f"{m.rewards_daily_rate:.2f}", f"{sc.rebate_potential:.2f}",
+                    f"{sc.score:.3f}", f"{m.rewards_daily_rate:.2f}",
+                    "" if m.reward_competitiveness is None else f"{m.reward_competitiveness:.6f}",
+                    f"{sc.rebate_potential:.2f}",
                     f"{sc.spread:.4f}", m.best_bid, m.best_ask, f"{m.tick_size:g}",
                     f"{m.min_order_size:g}", int(m.neg_risk), f"{m.taker_fee_bps / 100:.1f}",
                     f"{m.rebate_rate * 100:.0f}", m.rewards_max_spread, f"{m.liquidity_num:.0f}",
@@ -159,4 +162,5 @@ def _dump_meta(meta: MarketMeta) -> str:
 def _load_meta(blob: str) -> MarketMeta:
     d = json.loads(blob)
     d["tokens"] = tuple(TokenMeta(**t) for t in d["tokens"])
+    d.setdefault("reward_competitiveness", None)
     return MarketMeta(**d)

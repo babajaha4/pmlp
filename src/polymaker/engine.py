@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from polymaker.alerts import Alerter
-from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
+from polymaker.catalog.gamma import GammaClient, parse_market
+from polymaker.catalog.rewards import (
+    RewardMarketSnapshot,
+    RewardMarketsReadError,
+    apply_reward_snapshot,
+    clear_reward_snapshot,
+    fetch_reward_markets,
+)
 from polymaker.catalog.store import CatalogStore
 from polymaker.config import Config, StrategyProfile
 from polymaker.domain import Fill, MarketMeta, Regime, Side, TargetQuotes, TradeState
@@ -62,6 +69,7 @@ _TRADE_SYNC_PENDING = "confirmed_trade_pending"
 _TRADE_SYNC_REQUIRE_PROOF = "confirmed_trade_requires_proof"
 _TRADE_SYNC_PENDING_MAX_AGE_S = 7 * 86400
 _CANCEL_ASSET_TIMEOUT_S = 15.0
+_CANCEL_ASSET_CONCURRENCY = 3
 
 
 def _utc_day_start_ts(now: float | None = None) -> int:
@@ -117,6 +125,8 @@ class Engine:
         self._user_started = False  # user WS task launched (live mode)
         self._hb_was_down = False
         self._state_unknown = False  # authoritative REST snapshot is unavailable
+        self._state_unknown_quarantined = False
+        self._state_unknown_quarantine_attempts = 0
         self._chain_lock = asyncio.Lock()  # serialize on-chain txs (nonce safety)
         self._shutdown_started = False
 
@@ -211,16 +221,13 @@ class Engine:
 
     # ── market resolution ───────────────────────────────────────────────
     async def _resolve_markets(self) -> None:
-        reward_rates: dict[str, float] | None = None
         async with GammaClient(self.cfg.wallet.gamma_host) as gamma:
             for entry in self.cfg.enabled_markets:
                 meta = self.catalog.get_by_slug(entry.slug) if entry.slug else None
                 if meta is None and entry.condition_id:
                     meta = self.catalog.get(entry.condition_id)
                 if meta is None:  # fall back to a live Gamma fetch
-                    if reward_rates is None:
-                        reward_rates = await fetch_reward_rates(self.cfg.wallet.clob_host)
-                    meta = await self._fetch_meta(gamma, entry.slug, entry.condition_id, reward_rates)
+                    meta = await self._fetch_meta(gamma, entry.slug, entry.condition_id)
                 if meta is None:
                     log.warning("market_unresolved", ref=entry.ref)
                     continue
@@ -236,7 +243,6 @@ class Engine:
 
     async def _fetch_meta(
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
-        reward_rates: dict[str, float],
     ) -> MarketMeta | None:
         tag_id = self.catalog.cached_tag("politics")
         if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
@@ -245,7 +251,7 @@ class Engine:
                 self.catalog.cache_tag("politics", tag_id)
         async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
             if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
-                m = parse_market(raw, reward_rates)
+                m = parse_market(raw)
                 if m:
                     self.catalog.upsert_market(m)
                 return m
@@ -265,6 +271,7 @@ class Engine:
         try:
             if not await self._cancel_managed_assets():
                 raise GatewayReadError("managed-token cancellation could not be confirmed")
+            self._state_unknown_quarantined = True
             self.state.drop_untracked_positions(set(self._token_cid))
             positions_n, _ = await self._reconcile_authoritative_state(startup=True)
             managed_leftover = [o for o in self.state.orders.values() if o.token_id in self._token_cid]
@@ -278,9 +285,9 @@ class Engine:
             self.risk.establish_daily_baseline()
             log.info("startup_positions", n=positions_n)
             self._state_unknown = False
+            self._state_unknown_quarantined = False
         except Exception:
-            self._state_unknown = True
-            await self._cancel_managed_assets()
+            await self._quarantine_unknown_state()
             raise
 
     async def _sync_confirmed_trades(self, full_day: bool = False) -> int:
@@ -437,10 +444,10 @@ class Engine:
                 self.state.set_sync_value(_TRADE_SYNC_INITIALIZED, "1")
                 self.state.set_sync_value(_TRADE_SYNC_REQUIRE_PROOF, "0")
                 self._state_unknown = False
+                self._state_unknown_quarantined = False
             return len(positions), len(live)
         except Exception:
-            self._state_unknown = True
-            await self._cancel_managed_assets()
+            await self._quarantine_unknown_state()
             raise
 
     def _load_onchain_proof(self) -> dict[str, float] | None:
@@ -497,17 +504,34 @@ class Engine:
             token.token_id for meta in self.metas.values() for token in (meta.yes, meta.no)
         ])
 
+    async def _quarantine_unknown_state(self) -> bool:
+        """Cancel managed orders once per unknown-state episode.
+
+        A failed cancellation remains retryable on the next reconciliation
+        cycle. A confirmed cancellation is not repeated until a complete fresh
+        authoritative snapshot restores known state.
+        """
+        self._state_unknown = True
+        if self._state_unknown_quarantined:
+            return True
+        self._state_unknown_quarantine_attempts += 1
+        confirmed = await self._cancel_managed_assets()
+        self._state_unknown_quarantined = confirmed
+        return confirmed
+
     async def _cancel_assets(self, tokens: list[str]) -> bool:
         # Invalidate waiters before waiting for an already-submitted placement.
         # Cancellation never acquires market or reservation locks.
         self._placement_epoch += 1
         unique_tokens = list(dict.fromkeys(tokens))
+        semaphore = asyncio.Semaphore(_CANCEL_ASSET_CONCURRENCY)
 
         async def cancel_one(tok: str) -> bool:
             try:
-                cancelled = await asyncio.wait_for(
-                    self.gateway.cancel_asset(tok), timeout=_CANCEL_ASSET_TIMEOUT_S,
-                )
+                async with semaphore:
+                    cancelled = await asyncio.wait_for(
+                        self.gateway.cancel_asset(tok), timeout=_CANCEL_ASSET_TIMEOUT_S,
+                    )
                 if cancelled:
                     for order in self.state.orders_for(tok):
                         self.state.remove_order(order.order_id)
@@ -986,6 +1010,7 @@ class Engine:
             forced = self._reconcile_now.is_set()
             self._reconcile_now.clear()
             rounds += 1
+            quarantine_attempts = self._state_unknown_quarantine_attempts
             try:
                 # a MATCHED whose settlement event was lost would block a token's
                 # reconciliation forever — expire stale in-flight guards first
@@ -1009,7 +1034,8 @@ class Engine:
                 read_failure_streak = 0
             except Exception as exc:
                 self._state_unknown = True
-                await self._cancel_managed_assets()
+                if self._state_unknown_quarantine_attempts == quarantine_attempts:
+                    await self._quarantine_unknown_state()
                 read_failure_streak += 1
                 self.alerter.alert("state_unknown", str(exc), critical=True)
                 log.critical("state_unknown", err=str(exc))
@@ -1053,6 +1079,10 @@ class Engine:
                 return
             diverged = True
             self._state_unknown = True
+            # A newer on-chain observation invalidates every in-progress REST
+            # snapshot even when this unknown-state episode is already safely
+            # quarantined and therefore does not need another cancellation.
+            self._placement_epoch += 1
             retained = dict(proof) if proof is not None else {}
             retained.update(corrections)
             # One committed row holds every unresolved correction before any
@@ -1078,7 +1108,7 @@ class Engine:
         finally:
             if diverged:
                 self._reconcile_now.set()
-                await self._cancel_managed_assets()
+                await self._quarantine_unknown_state()
 
     async def refresh_market_metadata(self) -> None:
         """Pull fresh metadata from Gamma for all traded markets: halt on
@@ -1088,14 +1118,33 @@ class Engine:
         periodically. Safe to await."""
         if not self.metas:
             return
+        raws: dict[str, dict[str, Any]] = {}
         try:
             async with GammaClient(self.cfg.wallet.gamma_host) as gamma:
                 raws = await gamma.markets_by_condition(list(self.metas))
         except Exception as exc:  # noqa: BLE001
             log.warning("metadata_refresh_error", err=str(exc))
-            return
-        for cid, raw in raws.items():
-            if cid not in self.metas:
+        reward_markets: dict[str, RewardMarketSnapshot] | None = None
+        try:
+            reward_markets = await fetch_reward_markets(
+                self.cfg.wallet.clob_host,
+                condition_ids=self.metas,
+                event_ids=(meta.event_id for meta in self.metas.values() if meta.event_id),
+            )
+        except RewardMarketsReadError as exc:
+            # Preserve the last complete snapshot. Unknown is never zero competition.
+            log.warning("reward_markets_refresh_error", err=str(exc))
+
+        for cid in list(self.metas):
+            raw = raws.get(cid)
+            snapshot = reward_markets.get(cid) if reward_markets is not None else None
+            if raw is None:
+                self._apply_meta_refresh(
+                    cid,
+                    {},
+                    snapshot,
+                    reward_snapshot_complete=reward_markets is not None,
+                )
                 continue
             accepting = bool(raw.get("acceptingOrders", True))
             closed = bool(raw.get("closed", False))
@@ -1114,7 +1163,12 @@ class Engine:
                     self._wake_cid(cid)
                 continue
             self._halted.discard(cid)
-            self._apply_meta_refresh(cid, raw)
+            self._apply_meta_refresh(
+                cid,
+                raw,
+                snapshot,
+                reward_snapshot_complete=reward_markets is not None,
+            )
         self._refresh_reward_entry_allocation()
 
     def _refresh_reward_entry_allocation(self) -> None:
@@ -1144,7 +1198,14 @@ class Engine:
             )
             self._reward_entry_warning_emitted = True
 
-    def _apply_meta_refresh(self, cid: str, raw: dict[str, Any]) -> None:
+    def _apply_meta_refresh(
+        self,
+        cid: str,
+        raw: dict[str, Any],
+        reward_snapshot: RewardMarketSnapshot | None = None,
+        *,
+        reward_snapshot_complete: bool = False,
+    ) -> None:
         import dataclasses
 
         old = self.metas[cid]
@@ -1160,8 +1221,25 @@ class Engine:
         }
         updates = {k: v for k, v in candidates.items()
                    if v is not None and getattr(old, k) != v}
-        if updates:
-            self.metas[cid] = dataclasses.replace(old, **updates)
+        refreshed = dataclasses.replace(old, **updates) if updates else old
+        if reward_snapshot is not None:
+            refreshed = apply_reward_snapshot(refreshed, reward_snapshot)
+        elif reward_snapshot_complete:
+            refreshed = clear_reward_snapshot(refreshed)
+        if refreshed != old:
+            reward_updates = {
+                key: getattr(refreshed, key)
+                for key in (
+                    "rewards_daily_rate",
+                    "rewards_min_size",
+                    "rewards_max_spread",
+                    "reward_competitiveness",
+                )
+                if getattr(refreshed, key) != getattr(old, key)
+            }
+            updates.update(reward_updates)
+            self.metas[cid] = refreshed
+            self.catalog.upsert_market(refreshed)
             log.info("meta_refreshed", cid=cid[:8], **updates)
             self._wake_cid(cid)
 

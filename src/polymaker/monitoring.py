@@ -31,6 +31,10 @@ class MonitoringGateway(Protocol):
 
     async def get_book(self, token_id: str) -> dict[str, float]: ...
 
+    async def official_liquidity_rewards(
+        self, day: str, order_ids: list[str],
+    ) -> dict[str, Any]: ...
+
     def close(self) -> None: ...
 
 
@@ -317,6 +321,27 @@ async def collect_live_snapshot(
             else:
                 warnings.append(f"public order book unavailable for {token_id[:12]}")
 
+        reward_day = datetime.now(UTC).date().isoformat()
+        managed_order_ids = [order.order_id for order in orders if order.token_id in token_info]
+        try:
+            official_rewards = await live_gateway.official_liquidity_rewards(
+                reward_day, managed_order_ids,
+            )
+            official_rewards["available"] = True
+        except Exception as exc:  # noqa: BLE001 - monitoring must not turn unknown into zero
+            official_rewards = {
+                "available": False,
+                "date": reward_day,
+                "earnings": [],
+                "earnings_value": None,
+                "payout_eligible": None,
+                "percentages": {},
+                "order_scoring": {},
+                "scoring_order_count": None,
+                "checked_order_count": None,
+            }
+            warnings.append(f"official liquidity rewards unavailable: {exc}")
+
         market_rows: dict[str, dict[str, Any]] = {}
         for entry, meta, _ in configured:
             regime = next(
@@ -346,6 +371,9 @@ async def collect_live_snapshot(
                 "exposure_limit": cfg.risk.max_market_notional_usdc,
                 "positions": [],
                 "order_count": 0,
+                "reward_percentage": official_rewards["percentages"].get(meta.condition_id),
+                "official_reward_pool_per_day": meta.rewards_daily_rate,
+                "official_reward_competitiveness": meta.reward_competitiveness,
             }
 
         position_rows: list[dict[str, Any]] = []
@@ -408,6 +436,7 @@ async def collect_live_snapshot(
                 "size": order.size,
                 "notional": notional,
                 "managed": order_info is not None,
+                "reward_scoring": official_rewards["order_scoring"].get(order.order_id),
             })
 
         for condition_id, market in market_rows.items():
@@ -482,6 +511,7 @@ async def collect_live_snapshot(
                 "latest": _latest_fills(conn, token_info),
             },
             "latest_pnl_snapshot": _latest_pnl(conn),
+            "official_liquidity_rewards": official_rewards,
             "strategy": _strategy_payload(cfg, configured),
             "warnings": warnings,
         }

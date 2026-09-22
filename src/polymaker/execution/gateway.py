@@ -13,14 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import math
+import random
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from datetime import date
 from typing import Any, TypeVar
 
 import httpx
+from py_clob_client_v2.clob_types import RequestArgs
+from py_clob_client_v2.headers.headers import create_level_2_headers
 
 from polymaker.config import Config
 from polymaker.domain import MarketMeta, OpenOrder, OrderState, Quote, Side
@@ -31,6 +36,11 @@ from polymaker.logging import get_logger
 log = get_logger("execution.gateway")
 
 _T = TypeVar("_T")
+_DATA_READ_ATTEMPTS = 3
+_DATA_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
+_DATA_RETRY_BASE_DELAY_S = 1.0
+_DATA_RETRY_MAX_DELAY_S = 15.0
+_LIQUIDITY_REWARD_MIN_PAYOUT = 1.0
 
 
 class GatewayReadError(RuntimeError):
@@ -57,6 +67,7 @@ class ExecutionGateway:
         self._address: str = ""  # signer EOA
         self._funder: str = ""  # funds/positions live here (proxy/deposit wallet)
         self._data_host = cfg.wallet.data_api_host
+        self._data_client = httpx.Client(timeout=15.0)
         # rate budgets: fraction of documented POST/DELETE ceilings (per second)
         f = cfg.execution.rate_budget_fraction
         self._order_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
@@ -78,6 +89,7 @@ class ExecutionGateway:
         return self._order_bucket.pressure
 
     def close(self) -> None:
+        self._data_client.close()
         self._pool.shutdown(wait=False, cancel_futures=True)
 
     async def _io(self, fn: Callable[..., _T], *args: Any) -> _T:
@@ -592,22 +604,139 @@ class ExecutionGateway:
             return {}
         if not user or not user.startswith("0x"):
             raise GatewayReadError("positions snapshot unavailable: invalid funder")
+
+        def _get() -> dict[str, tuple[float, float]]:
+            response: httpx.Response | None = None
+            for attempt in range(_DATA_READ_ATTEMPTS):
+                try:
+                    response = self._data_client.get(
+                        f"{self._data_host}/positions", params={"user": user}
+                    )
+                    if response.status_code not in _DATA_RETRYABLE_STATUS:
+                        response.raise_for_status()
+                        break
+                    if attempt == _DATA_READ_ATTEMPTS - 1:
+                        response.raise_for_status()
+                    delay = _data_retry_delay(response, attempt)
+                    log.warning(
+                        "positions_retry",
+                        status=response.status_code,
+                        attempt=attempt + 1,
+                        delay_s=round(delay, 2),
+                    )
+                    time.sleep(delay)
+                except httpx.TransportError as exc:
+                    if attempt == _DATA_READ_ATTEMPTS - 1:
+                        raise
+                    delay = _data_retry_delay(None, attempt)
+                    log.warning(
+                        "positions_retry",
+                        err=str(exc),
+                        attempt=attempt + 1,
+                        delay_s=round(delay, 2),
+                    )
+                    time.sleep(delay)
+            if response is None:
+                raise RuntimeError("positions request produced no response")
+
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("positions payload is not a list")
+            positions: dict[str, tuple[float, float]] = {}
+            for p in payload:
+                if not isinstance(p, dict):
+                    raise ValueError("position row is not an object")
+                asset = p.get("asset")
+                if not isinstance(asset, str) or not asset:
+                    raise ValueError("position row has invalid asset")
+                size = float(p.get("size", 0))
+                avg = float(p.get("avgPrice", 0))
+                if not math.isfinite(size) or not math.isfinite(avg):
+                    raise ValueError("nonfinite position economics")
+                if size > 0:
+                    positions[asset] = (size, avg)
+            return positions
+
         try:
-            async with httpx.AsyncClient(timeout=15.0) as c:
-                r = await c.get(f"{self._data_host}/positions", params={"user": user})
-                r.raise_for_status()
-                positions = {}
-                for p in r.json():
-                    size = float(p.get("size", 0))
-                    avg = float(p.get("avgPrice", 0))
-                    if not math.isfinite(size) or not math.isfinite(avg):
-                        raise ValueError("nonfinite position economics")
-                    if size > 0:
-                        positions[str(p["asset"])] = (size, avg)
-                return positions
+            return await self._io(_get)
         except Exception as exc:  # noqa: BLE001 - a snapshot failure is fail-closed
             log.warning("positions_failed", err=str(exc))
             raise GatewayReadError("positions snapshot unavailable") from exc
+
+    async def official_liquidity_rewards(
+        self, day: str, order_ids: list[str],
+    ) -> dict[str, Any]:
+        """Read official CLOB reward earnings and live scoring state.
+
+        L2 credentials authenticate the request. The maker query is explicitly
+        scoped to the funder/Deposit Wallet because that address owns signature
+        type 3 orders and receives the daily reward distribution.
+        """
+        if self._client is None or self._creds is None:
+            raise GatewayReadError("official liquidity rewards unavailable: gateway not connected")
+        try:
+            parsed_day = date.fromisoformat(day)
+        except ValueError as exc:
+            raise GatewayReadError("official liquidity rewards unavailable: invalid date") from exc
+        if parsed_day.isoformat() != day:
+            raise GatewayReadError("official liquidity rewards unavailable: invalid date")
+        unique_order_ids = list(dict.fromkeys(order_ids))
+        if any(not isinstance(order_id, str) or not order_id for order_id in unique_order_ids):
+            raise GatewayReadError("official liquidity rewards unavailable: invalid order identity")
+
+        def _read() -> dict[str, Any]:
+            maker_params: dict[str, str | int | float | bool | None] = {
+                "maker_address": self.funder,
+                "signature_type": int(self._cfg.wallet.signature_type),
+            }
+            total_response = self._authenticated_reward_get(
+                "/rewards/user/total", {"date": day, **maker_params}
+            )
+            percentages_response = self._authenticated_reward_get(
+                "/rewards/user/percentages", maker_params
+            )
+            scoring_response: object = {}
+            if unique_order_ids:
+                scoring_path = "/orders-scoring"
+                serialized = json.dumps(unique_order_ids, separators=(",", ":"))
+                request = RequestArgs(
+                    method="POST", request_path=scoring_path,
+                    body=unique_order_ids, serialized_body=serialized,
+                )
+                headers = create_level_2_headers(
+                    self._client.signer, self._creds, request,
+                )
+                headers["Content-Type"] = "application/json"
+                response = self._data_client.post(
+                    f"{self._cfg.wallet.clob_host.rstrip('/')}{scoring_path}",
+                    headers=headers,
+                    content=serialized,
+                )
+                response.raise_for_status()
+                scoring_response = response.json()
+            return _parse_official_rewards(
+                day, self.funder, unique_order_ids,
+                total_response, percentages_response, scoring_response,
+            )
+
+        try:
+            return await self._io(_read)
+        except Exception as exc:  # noqa: BLE001 - optional snapshot remains explicitly unknown
+            log.warning("official_liquidity_rewards_failed", err=str(exc))
+            raise GatewayReadError("official liquidity rewards unavailable") from exc
+
+    def _authenticated_reward_get(
+        self, path: str, params: dict[str, str | int | float | bool | None],
+    ) -> object:
+        request = RequestArgs(method="GET", request_path=path)
+        headers = create_level_2_headers(self._client.signer, self._creds, request)
+        response = self._data_client.get(
+            f"{self._cfg.wallet.clob_host.rstrip('/')}{path}",
+            headers=headers,
+            params=params,
+        )
+        response.raise_for_status()
+        return response.json()
 
     async def balance_allowance(self) -> dict[str, Any]:
         """Collateral balance/allowance snapshot (for `doctor`)."""
@@ -642,3 +771,90 @@ def _first(d: Any, *keys: str) -> Any:
         if k in d and d[k]:
             return d[k]
     return None
+
+
+def _data_retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                parsed = float(retry_after)
+            except ValueError:
+                pass
+            else:
+                if math.isfinite(parsed) and parsed >= 0:
+                    return min(parsed, _DATA_RETRY_MAX_DELAY_S)
+    exponential = float(_DATA_RETRY_BASE_DELAY_S * (2**attempt))
+    jitter = float(random.uniform(0.0, 0.25))
+    return float(min(exponential + jitter, _DATA_RETRY_MAX_DELAY_S))
+
+
+def _parse_official_rewards(
+    day: str,
+    funder: str,
+    order_ids: list[str],
+    total_payload: object,
+    percentages_payload: object,
+    scoring_payload: object,
+) -> dict[str, Any]:
+    if not isinstance(total_payload, list):
+        raise ValueError("official earnings payload is not a list")
+    earnings: list[dict[str, Any]] = []
+    earnings_value = 0.0
+    for row in total_payload:
+        if not isinstance(row, dict):
+            raise ValueError("official earnings row is not an object")
+        asset = row.get("asset_address")
+        maker = row.get("maker_address")
+        observed_day = row.get("date")
+        if not isinstance(asset, str) or not asset:
+            raise ValueError("official earnings asset is invalid")
+        if not isinstance(maker, str) or maker.lower() != funder.lower():
+            raise ValueError("official earnings maker does not match funder")
+        if not isinstance(observed_day, str) or not observed_day.startswith(day):
+            raise ValueError("official earnings date does not match query")
+        amount = _nonnegative_finite_float(row.get("earnings"))
+        asset_rate = _nonnegative_finite_float(row.get("asset_rate"))
+        earnings.append({
+            "asset_address": asset,
+            "earnings": amount,
+            "asset_rate": asset_rate,
+        })
+        earnings_value += amount * asset_rate
+
+    if not isinstance(percentages_payload, dict):
+        raise ValueError("official reward percentages payload is not an object")
+    percentages: dict[str, float] = {}
+    for condition_id, raw_percentage in percentages_payload.items():
+        percentage = _nonnegative_finite_float(raw_percentage)
+        if (
+            not isinstance(condition_id, str) or not condition_id
+            or percentage > 100
+        ):
+            raise ValueError("official reward percentage is invalid")
+        percentages[condition_id] = percentage
+
+    if not isinstance(scoring_payload, dict) or set(scoring_payload) != set(order_ids):
+        raise ValueError("official order scoring snapshot is incomplete")
+    if any(type(value) is not bool for value in scoring_payload.values()):
+        raise ValueError("official order scoring value is invalid")
+    order_scoring = {order_id: bool(scoring_payload[order_id]) for order_id in order_ids}
+    return {
+        "date": day,
+        "earnings": earnings,
+        "earnings_value": earnings_value,
+        "payout_eligible": earnings_value >= _LIQUIDITY_REWARD_MIN_PAYOUT,
+        "percentages": percentages,
+        "order_scoring": order_scoring,
+        "scoring_order_count": sum(order_scoring.values()),
+        "checked_order_count": len(order_scoring),
+    }
+
+
+def _nonnegative_finite_float(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("official reward number is invalid")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("official reward number is invalid")
+    return number

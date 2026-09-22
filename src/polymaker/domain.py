@@ -94,6 +94,9 @@ class MarketMeta:
     liquidity_num: float = 0.0
     volume_num: float = 0.0  # lifetime
     volume_24hr: float = 0.0  # trailing 24h CLOB volume (drives rebate estimate)
+    # Official CLOB rewards-market score. Higher means more competing liquidity.
+    # None means the authoritative snapshot is unavailable, not zero competition.
+    reward_competitiveness: float | None = None
 
     @property
     def yes(self) -> TokenMeta:

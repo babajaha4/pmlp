@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
+from polymaker.catalog.rewards import RewardMarketSnapshot, RewardMarketsReadError
 from polymaker.config import Config, PathsConfig, StrategyProfile
 from polymaker.domain import Side
 from polymaker.engine import Engine
@@ -115,3 +117,104 @@ async def test_shutdown_closes_streams_and_is_idempotent(tmp_path, meta):
     eng.md.close.assert_awaited_once()
     eng.user.close.assert_awaited_once()
     assert eng.gateway.cancel_asset.await_count == 2
+
+
+async def test_metadata_refresh_applies_official_reward_competition(
+    tmp_path, meta, monkeypatch
+):
+    eng = _engine_with_market(tmp_path, replace(meta, reward_competitiveness=999.0))
+
+    class FakeGamma:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def markets_by_condition(self, _condition_ids):
+            return {meta.condition_id: {"acceptingOrders": True, "closed": False}}
+
+    monkeypatch.setattr("polymaker.engine.GammaClient", lambda *_args, **_kwargs: FakeGamma())
+    monkeypatch.setattr(
+        "polymaker.engine.fetch_reward_markets",
+        AsyncMock(return_value={
+            meta.condition_id: RewardMarketSnapshot(
+                meta.condition_id, 80.0, 20.0, 4.0, 12.0
+            )
+        }),
+    )
+
+    await eng.refresh_market_metadata()
+
+    refreshed = eng.metas[meta.condition_id]
+    assert refreshed.rewards_daily_rate == 80.0
+    assert refreshed.rewards_min_size == 20.0
+    assert refreshed.rewards_max_spread == 4.0
+    assert refreshed.reward_competitiveness == 12.0
+    assert eng.catalog.get(meta.condition_id).reward_competitiveness == 12.0
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_reward_api_failure_preserves_last_valid_competition(
+    tmp_path, meta, monkeypatch
+):
+    original = replace(meta, rewards_daily_rate=70.0, reward_competitiveness=33.0)
+    eng = _engine_with_market(tmp_path, original)
+
+    class FakeGamma:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def markets_by_condition(self, _condition_ids):
+            return {meta.condition_id: {"acceptingOrders": True, "closed": False}}
+
+    async def fail_rewards(*_args, **_kwargs):
+        raise RewardMarketsReadError("down")
+
+    monkeypatch.setattr("polymaker.engine.GammaClient", lambda *_args, **_kwargs: FakeGamma())
+    monkeypatch.setattr("polymaker.engine.fetch_reward_markets", fail_rewards)
+
+    await eng.refresh_market_metadata()
+
+    assert eng.metas[meta.condition_id].rewards_daily_rate == 70.0
+    assert eng.metas[meta.condition_id].reward_competitiveness == 33.0
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_slug_cold_start_resolves_before_reward_refresh(tmp_path, meta):
+    cfg = Config(paths=PathsConfig(
+        db=str(tmp_path / "cold.db"),
+        journal_dir=str(tmp_path / "j"),
+        log_dir=str(tmp_path / "l"),
+    ))
+    engine = Engine(cfg, paper=True)
+    raw = {
+        "conditionId": meta.condition_id,
+        "question": meta.question,
+        "slug": meta.slug,
+        "clobTokenIds": '["yes-token", "no-token"]',
+        "outcomes": '["Yes", "No"]',
+        "acceptingOrders": True,
+        "rewardsMinSize": 10,
+        "rewardsMaxSpread": 3,
+    }
+
+    class FakeGamma:
+        async def resolve_tag_id(self, _slug):
+            return "tag"
+
+        async def iter_markets(self, **_kwargs):
+            yield raw
+
+    resolved = await engine._fetch_meta(FakeGamma(), meta.slug, None)
+
+    assert resolved is not None
+    assert resolved.condition_id == meta.condition_id
+    assert resolved.reward_competitiveness is None
+    engine.state.close()
+    engine.catalog.close()

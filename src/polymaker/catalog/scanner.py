@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from polymaker.catalog.gamma import (
     POLITICS_TAG_SLUG,
     GammaClient,
-    fetch_reward_rates,
     parse_market,
 )
+from polymaker.catalog.rewards import apply_reward_snapshot, fetch_reward_markets
 from polymaker.catalog.scoring import score_market
 from polymaker.catalog.store import CatalogStore
 from polymaker.domain import MarketMeta
@@ -34,8 +34,9 @@ class ScanConfig:
 
 async def run_scan(store: CatalogStore, cfg: ScanConfig) -> list[MarketMeta]:
     """Fetch, parse, filter, score, and persist. Returns the kept markets."""
-    reward_rates = await fetch_reward_rates(cfg.clob_host)
-    log.info("reward_rates_loaded", n=len(reward_rates))
+    reward_markets = await fetch_reward_markets(cfg.clob_host, tag_slug=cfg.tag_slug)
+    reward_rates = {cid: snapshot.daily_rate for cid, snapshot in reward_markets.items()}
+    log.info("reward_markets_loaded", n=len(reward_markets))
 
     kept: list[MarketMeta] = []
     async with GammaClient(cfg.gamma_host) as gamma:
@@ -53,6 +54,9 @@ async def run_scan(store: CatalogStore, cfg: ScanConfig) -> list[MarketMeta]:
             meta = parse_market(raw, reward_rates)
             if meta is None:
                 continue
+            snapshot = reward_markets.get(meta.condition_id)
+            if snapshot is not None:
+                meta = apply_reward_snapshot(meta, snapshot)
             if cfg.rewards_only and meta.rewards_daily_rate <= 0:
                 continue
             kept.append(meta)

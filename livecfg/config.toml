@@ -10,7 +10,7 @@ polygon_rpc = "https://polygon-bor-rpc.publicnode.com"
 
 [engine]
 debounce_ms = 250
-reconcile_interval_s = 20
+reconcile_interval_s = 60
 catalog_refresh_s = 300
 heartbeat = true
 heartbeat_interval_s = 5

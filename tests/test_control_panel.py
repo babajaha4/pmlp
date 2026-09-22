@@ -52,6 +52,22 @@ class FakeGateway:
             return {"best_bid": 0.39, "best_ask": 0.41, "bid_depth": 10, "ask_depth": 10}
         return {"best_bid": 0.59, "best_ask": 0.61, "bid_depth": 10, "ask_depth": 10}
 
+    async def official_liquidity_rewards(
+        self, day: str, order_ids: list[str],
+    ) -> dict[str, Any]:
+        assert len(day) == 10
+        assert order_ids == ["managed"]
+        return {
+            "date": day,
+            "earnings": [{"asset_address": "0xpUSD", "earnings": 1.25, "asset_rate": 1.0}],
+            "earnings_value": 1.25,
+            "payout_eligible": True,
+            "percentages": {"0xcond": 12.5},
+            "order_scoring": {"managed": True},
+            "scoring_order_count": 1,
+            "checked_order_count": 1,
+        }
+
     def close(self) -> None:
         self.closed = True
 
@@ -284,6 +300,45 @@ async def test_read_only_snapshot_reports_exchange_ledger_risk_and_strategy(tmp_
     assert snapshot["fills"]["all"]["maker_count"] == 1
     assert snapshot["strategy"]["maker_only"]
     assert snapshot["strategy"]["profiles"][0]["profile"] == "tiny"
+    assert snapshot["official_liquidity_rewards"]["available"] is True
+    assert snapshot["official_liquidity_rewards"]["earnings_value"] == pytest.approx(1.25)
+    assert snapshot["markets"][0]["reward_percentage"] == pytest.approx(12.5)
+    assert snapshot["markets"][0]["official_reward_competitiveness"] == pytest.approx(0.0)
+    assert snapshot["orders"][0]["reward_scoring"] is True
+    assert snapshot["orders"][1]["reward_scoring"] is None
+
+
+async def test_official_reward_failure_is_unknown_not_zero(tmp_path, meta):
+    class RewardFailureGateway(FakeGateway):
+        async def official_liquidity_rewards(
+            self, day: str, order_ids: list[str],
+        ) -> dict[str, Any]:
+            raise RuntimeError("reward API unavailable")
+
+    db = tmp_path / "reward-failure.db"
+    catalog = CatalogStore(db)
+    catalog.upsert_market(meta)
+    catalog.close()
+    state = StateStore(db)
+    state.close()
+    cfg = Config(
+        paths=PathsConfig(db=str(db), log_dir=str(tmp_path), journal_dir=str(tmp_path)),
+        profiles={"tiny": StrategyProfile()},
+        markets=[MarketEntry(slug=meta.slug, profile="tiny")],
+    )
+    snapshot = await collect_live_snapshot(
+        cfg,
+        gateway=RewardFailureGateway(),
+        service_status={
+            "load_state": "loaded", "active_state": "active", "sub_state": "running",
+            "main_pid": 123, "restarts": 0, "active_since": "",
+        },
+    )
+
+    rewards = snapshot["official_liquidity_rewards"]
+    assert rewards["available"] is False
+    assert rewards["earnings_value"] is None
+    assert any("official liquidity rewards unavailable" in item for item in snapshot["warnings"])
 
 
 async def test_true_empty_exchange_snapshot_remains_healthy(tmp_path, meta):
@@ -365,6 +420,9 @@ def test_control_panel_assets_do_not_embed_secrets(tmp_path):
     page = app.page().decode()
     script, content_type = app.asset("app.js")
     assert app.control_token in page
+    assert "officialRewardMetric" in page
+    assert b"official_liquidity_rewards" in script
+    assert b"reward_scoring" in script
     assert "__CONTROL_TOKEN__" not in page
     assert "PK=" not in page
     assert b"innerHTML" not in script

@@ -374,7 +374,7 @@ def serve_control_panel(
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
-    poll_seconds: int = 20,
+    poll_seconds: int = 60,
     open_browser: bool = True,
 ) -> None:
     try:

@@ -422,7 +422,7 @@ def control_panel(
     unit: str = typer.Option("polymaker-live.service", help="VPS systemd unit"),
     host: str = typer.Option("127.0.0.1", help="loopback bind address"),
     port: int = typer.Option(8765, min=1, max=65535, help="local HTTP port"),
-    poll_seconds: int = typer.Option(20, min=5, max=300, help="refresh interval"),
+    poll_seconds: int = typer.Option(60, min=5, max=300, help="refresh interval"),
     open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser"),
 ) -> None:
     """Run the loopback-only VPS operations dashboard."""

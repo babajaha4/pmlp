@@ -36,7 +36,7 @@ class EngineConfig(BaseModel):
     # is just a slow refresh for cool-off re-entry / exit-urgency updates). A
     # precise wake is also scheduled for the exact moment an EVENT cool-off ends.
     quoter_tick_s: float = 60.0
-    reconcile_interval_s: float = 30.0
+    reconcile_interval_s: float = 60.0
     catalog_refresh_s: float = 900.0
     heartbeat: bool = True
     heartbeat_interval_s: float = 5.0

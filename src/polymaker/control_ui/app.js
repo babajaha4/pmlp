@@ -58,6 +58,16 @@ function renderMetrics(data) {
   metric("collateralMetric", money(data.wallet.collateral_pusd, 2));
   metric("equityMetric", `${summary.equity_mtm >= 0 ? "+" : ""}${money(summary.equity_mtm)}`, summary.equity_mtm >= 0 ? "positive" : "negative");
   metric("dailyPnlMetric", `${summary.daily_pnl_live >= 0 ? "+" : ""}${money(summary.daily_pnl_live)}`, summary.daily_pnl_live >= 0 ? "positive" : "negative");
+  const rewards = data.official_liquidity_rewards;
+  if (rewards.available) {
+    metric("officialRewardMetric", money(rewards.earnings_value, 4), rewards.earnings_value > 0 ? "positive" : undefined);
+    const scoring = `${rewards.scoring_order_count}/${rewards.checked_order_count} 挂单计分`;
+    const payout = rewards.payout_eligible ? "已达到 1 pUSD 支付门槛" : "未达到 1 pUSD 支付门槛";
+    $("officialRewardNote").textContent = `${rewards.date} UTC · ${scoring} · ${payout}`;
+  } else {
+    metric("officialRewardMetric", "--");
+    $("officialRewardNote").textContent = "官方 Rewards API 不可用；不按 0 处理";
+  }
   metric("exposureMetric", money(summary.total_exposure, 2));
   $("exposureNote").textContent = `${money(summary.total_exposure_limit, 0)} 上限 · ${number(percent(summary.total_exposure, summary.total_exposure_limit), 1)}%`;
   metric("ordersMetric", String(summary.open_order_count));
@@ -106,6 +116,9 @@ function renderMarkets(data) {
     row.append(
       name,
       element("td"),
+      element("td", "", market.official_reward_pool_per_day == null ? "--" : `${money(market.official_reward_pool_per_day)} / 日`),
+      element("td", "", market.official_reward_competitiveness == null ? "未知" : number(market.official_reward_competitiveness, 2)),
+      element("td", "", market.reward_percentage == null ? "--" : `${number(market.reward_percentage, 4)}%`),
       element("td", "", money(market.position_value)),
       element("td", "", money(market.buy_reservation)),
       element("td", "", money(market.exposure)),
@@ -113,10 +126,10 @@ function renderMarkets(data) {
       element("td", "", String(market.order_count)),
     );
     row.children[1].append(regimeNode(market.regime));
-    row.children[5].append(exposureBar(market.exposure, market.exposure_limit));
+    row.children[8].append(exposureBar(market.exposure, market.exposure_limit));
     body.append(row);
   });
-  if (!data.markets.length) emptyRow(body, 7, "没有配置市场");
+  if (!data.markets.length) emptyRow(body, 10, "没有配置市场");
   const ledger = $("ledgerBadge");
   ledger.textContent = data.summary.ledger_matches_positions ? "账本与权威仓位一致" : "账本与权威仓位不一致";
   ledger.className = `inline-state ${data.summary.ledger_matches_positions ? "ok" : "bad"}`;
@@ -180,11 +193,12 @@ function renderOrders(data) {
       element("td", "", number(order.price, 4)),
       element("td", "", number(order.size, 4)),
       element("td", "", money(order.notional)),
+      element("td", order.reward_scoring === false ? "negative" : order.reward_scoring === true ? "positive" : "", order.reward_scoring == null ? "未知" : order.reward_scoring ? "计分" : "不计分"),
       element("td", "", order.managed ? "机器人" : "未配置"),
     );
     body.append(row);
   });
-  if (!data.orders.length) emptyRow(body, 7, "当前没有权威挂单");
+  if (!data.orders.length) emptyRow(body, 8, "当前没有权威挂单");
   const badge = $("managedOrdersBadge");
   badge.textContent = data.summary.unconfigured_order_count === 0 ? "全部属于配置 token" : `${data.summary.unconfigured_order_count} 个未配置订单`;
   badge.className = `inline-state ${data.summary.unconfigured_order_count === 0 ? "ok" : "bad"}`;

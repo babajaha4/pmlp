@@ -357,6 +357,59 @@ async def test_unexpected_cancel_exception_keeps_quarantine_and_logs(
     )
 
 
+async def test_repeated_snapshot_failures_do_not_repeat_confirmed_quarantine(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway.trades = AsyncMock(side_effect=GatewayReadError("positions unavailable"))
+    eng.gateway.cancel_asset = AsyncMock(return_value=True)
+
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state()
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state()
+
+    assert eng._state_unknown
+    assert eng._state_unknown_quarantined
+    assert eng.gateway.cancel_asset.await_count == 2
+
+
+async def test_failed_quarantine_is_retried_on_next_snapshot_failure(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway.trades = AsyncMock(side_effect=GatewayReadError("positions unavailable"))
+    eng.gateway.cancel_asset = AsyncMock(side_effect=[False, True, True, True])
+
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state()
+    assert not eng._state_unknown_quarantined
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state()
+
+    assert eng._state_unknown
+    assert eng._state_unknown_quarantined
+    assert eng.gateway.cancel_asset.await_count == 4
+
+
+async def test_authoritative_recovery_resets_quarantine_for_future_failure(tmp_path, meta):
+    eng = _engine_with_market(tmp_path, meta)
+    eng.gateway.trades = AsyncMock(side_effect=GatewayReadError("positions unavailable"))
+    eng.gateway.cancel_asset = AsyncMock(return_value=True)
+
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state()
+    assert eng._state_unknown_quarantined
+
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    await eng._reconcile_authoritative_state()
+    assert not eng._state_unknown
+    assert not eng._state_unknown_quarantined
+
+    eng.gateway.trades = AsyncMock(side_effect=GatewayReadError("positions unavailable again"))
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state()
+    assert eng.gateway.cancel_asset.await_count == 4
+
+
 @pytest.mark.parametrize("field", ["price", "matched_amount", "timestamp"])
 async def test_huge_trade_number_is_a_failed_snapshot(tmp_path, meta, field):
     eng = _engine_with_market(tmp_path, meta)

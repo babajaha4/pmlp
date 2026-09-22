@@ -90,10 +90,10 @@ async def test_positions_snapshot_failure_is_not_empty(monkeypatch) -> None:
     gw = ExecutionGateway(Config(), paper=False)
     gw._funder = "0x0000000000000000000000000000000000000001"
 
-    async def fail(*_args, **_kwargs):
+    def fail(*_args, **_kwargs):
         raise OSError("network down")
 
-    monkeypatch.setattr("httpx.AsyncClient.get", fail)
+    monkeypatch.setattr("httpx.Client.get", fail)
     with pytest.raises(GatewayReadError):
         await gw.positions()
     gw.close()
@@ -397,6 +397,35 @@ async def test_engine_cancels_only_managed_tokens(tmp_path, meta) -> None:
     eng.gateway.cancel_asset = cancel  # type: ignore[method-assign]
     assert await eng._cancel_managed_assets() is True
     assert set(seen) == {meta.yes.token_id, meta.no.token_id}
+    eng.state.close()
+    eng.catalog.close()
+
+
+@pytest.mark.asyncio
+async def test_managed_token_cancellation_has_bounded_concurrency(tmp_path, meta) -> None:
+    cfg = Config(
+        paths=PathsConfig(
+            db=str(tmp_path / "state.db"),
+            journal_dir=str(tmp_path / "journal"),
+            log_dir=str(tmp_path / "logs"),
+        )
+    )
+    eng = Engine(cfg, paper=True)
+    tokens = [f"token-{index}" for index in range(8)]
+    active = 0
+    maximum = 0
+
+    async def cancel(_token: str) -> bool:
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return True
+
+    eng.gateway.cancel_asset = cancel  # type: ignore[method-assign]
+    assert await eng._cancel_assets(tokens) is True
+    assert maximum == 3
     eng.state.close()
     eng.catalog.close()
 

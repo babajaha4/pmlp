@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from polymaker.catalog.gamma import parse_market
+from polymaker.catalog.rewards import RewardMarketSnapshot, apply_reward_snapshot
 from polymaker.catalog.scoring import score_market
 from polymaker.catalog.store import CatalogStore
 
@@ -88,6 +89,38 @@ def test_store_upsert_is_idempotent(tmp_path):
     store.upsert_market(m)
     store.upsert_market(m)  # second time updates, not duplicates
     assert len(store.top(10)) == 1
+    store.close()
+
+
+def test_reward_snapshot_updates_official_reward_fields():
+    market = parse_market(RAW, {"0xabc": 42.0})
+    updated = apply_reward_snapshot(
+        market,
+        RewardMarketSnapshot(
+            condition_id="0xabc",
+            daily_rate=60.0,
+            min_size=20.0,
+            max_spread=4.0,
+            competitiveness=125.0,
+        ),
+    )
+
+    assert updated.rewards_daily_rate == 60.0
+    assert updated.rewards_min_size == 20.0
+    assert updated.rewards_max_spread == 4.0
+    assert updated.reward_competitiveness == 125.0
+
+
+def test_store_loads_legacy_metadata_without_competition(tmp_path):
+    store = CatalogStore(tmp_path / "legacy.db")
+    market = parse_market(RAW, {"0xabc": 42.0})
+    store.upsert_market(market)
+    store._conn.execute(  # noqa: SLF001 - simulate a pre-migration catalog row
+        "UPDATE markets SET meta_json=json_remove(meta_json, '$.reward_competitiveness')"
+    )
+    store._conn.commit()  # noqa: SLF001
+
+    assert store.get("0xabc").reward_competitiveness is None
     store.close()
 
 
