@@ -297,6 +297,14 @@ Not yet built: a continuously stateful paper fill engine and external data feeds
 enable it only after verifying the configured chain contracts and builder
 relayer credentials. Inventory exits remain maker-only limit sells by default.
 
+Operational recovery and bounded service retries are documented in
+[ops/README.md](ops/README.md). A retained chain proof can be superseded only
+after fresh chain balances, REST positions, and the confirmed ledger agree;
+failed checks retain the proof and halt startup with exit status 78. Dashboard
+daily PnL is unavailable if the UTC baseline is stale or proof recovery remains
+pending. The installed systemd unit suppresses retries for this exit status and
+limits other failures to five starts per hour with a 60-second delay.
+
 ## License
 
 MIT

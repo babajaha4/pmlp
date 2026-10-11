@@ -4,6 +4,7 @@ import http.client
 import json
 import subprocess
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -225,7 +226,8 @@ def test_start_requires_authoritative_ledger_and_state_check(tmp_path, monkeypat
         control.perform("start")
 
 
-async def test_read_only_snapshot_reports_exchange_ledger_risk_and_strategy(tmp_path, meta):
+@pytest.mark.parametrize("baseline", ["stale", "current", "proof"])
+async def test_read_only_snapshot_reports_exchange_ledger_risk_and_strategy(tmp_path, meta, baseline):
     db = tmp_path / "state.db"
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -235,7 +237,7 @@ async def test_read_only_snapshot_reports_exchange_ledger_risk_and_strategy(tmp_
     state = StateStore(db)
     state.apply_fill(Fill("yes-token", Side.BUY, 0.35, 10, "fill-1", is_maker=True))
     state.save_risk_state(
-        "2099-01-01",
+        "2099-01-01" if baseline == "stale" else datetime.now(UTC).date().isoformat(),
         day_start_equity=0.25,
         net_cash=-3.5,
         daily_pnl=0.25,
@@ -245,6 +247,8 @@ async def test_read_only_snapshot_reports_exchange_ledger_risk_and_strategy(tmp_
         order_errors=0,
     )
     state.record_pnl(0.5, -3.5, 4.0, 0.25)
+    if baseline == "proof":
+        state.set_sync_value("confirmed_trade_requires_proof", '{"yes-token":50}')
     state.close()
     (log_dir / "live.jsonl").write_text(
         json.dumps({
@@ -296,6 +300,12 @@ async def test_read_only_snapshot_reports_exchange_ledger_risk_and_strategy(tmp_
     assert snapshot["summary"]["inventory_value"] == pytest.approx(4.0)
     assert snapshot["summary"]["total_exposure"] == pytest.approx(8.0)
     assert snapshot["summary"]["ledger_matches_positions"]
+    if baseline == "current":
+        assert snapshot["summary"]["daily_pnl_live"] == pytest.approx(.25)
+        assert snapshot["summary"]["daily_pnl_available"]
+    else:
+        assert snapshot["summary"]["daily_pnl_live"] is None
+        assert not snapshot["summary"]["daily_pnl_available"]
     assert snapshot["markets"][0]["regime"] == "QUIET"
     assert snapshot["fills"]["all"]["maker_count"] == 1
     assert snapshot["strategy"]["maker_only"]

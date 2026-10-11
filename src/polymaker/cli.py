@@ -213,6 +213,7 @@ def run(
         raise typer.Exit(2)
 
     from polymaker.engine import Engine
+    from polymaker.execution.gateway import GatewayReadError
     from polymaker.logging import configure
 
     paper_mode = not live
@@ -248,6 +249,13 @@ def run(
         )
     try:
         asyncio.run(_go())
+    except GatewayReadError as exc:
+        from polymaker.logging import get_logger
+
+        get_logger("cli").error("startup_authoritative_check_failed", reason=str(exc))
+        console.print("[red]Authoritative startup checks failed; service remains stopped. "
+                      "Inspect the log and reconcile before restarting.[/red]")
+        raise typer.Exit(78) from None
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped.[/yellow]")
 

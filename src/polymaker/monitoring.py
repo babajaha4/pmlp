@@ -447,7 +447,16 @@ async def collect_live_snapshot(
 
         ledger_cash = float(_fill_aggregate(conn)["net_cash"])
         risk = _risk_state(conn)
-        daily_baseline = float(risk["day_start_equity"]) if risk else 0.0
+        baseline_current = bool(risk and risk["day_key"] == reward_day)
+        proof_row = conn.execute(
+            "SELECT value FROM sync_state WHERE key='confirmed_trade_requires_proof'"
+        ).fetchone()
+        proof_required = bool(proof_row and proof_row[0] != "0")
+        baseline_valid = baseline_current and not proof_required
+        if not baseline_valid:
+            warnings.append("daily PnL unavailable: UTC baseline stale or on-chain proof unresolved")
+        if proof_required:
+            warnings.append("retained on-chain proof requires authoritative reconciliation")
         equity = ledger_cash + inventory_value
         today_start = datetime.now(UTC).replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -486,7 +495,12 @@ async def collect_live_snapshot(
                 "inventory_value": inventory_value,
                 "net_cash": ledger_cash,
                 "equity_mtm": equity,
-                "daily_pnl_live": equity - daily_baseline,
+                "daily_pnl_live": (
+                    equity - float(risk["day_start_equity"]) if baseline_valid and risk else None
+                ),
+                "daily_pnl_available": baseline_valid,
+                "risk_baseline_day": risk["day_key"] if risk else None,
+                "onchain_proof_required": proof_required,
                 "total_exposure": total_exposure,
                 "total_exposure_limit": cfg.risk.max_total_exposure_usdc,
                 "ledger_matches_positions": ledger_matches,

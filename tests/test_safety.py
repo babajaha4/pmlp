@@ -45,6 +45,26 @@ def test_run_defaults_to_paper(monkeypatch) -> None:
     assert "PAPER" in result.stdout
 
 
+def test_authoritative_startup_failure_exits_without_restart_storm(monkeypatch):
+    closed = []
+
+    class FakeEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run_forever(self):
+            raise GatewayReadError("positions disagree with retained on-chain proof")
+
+        async def shutdown(self):
+            closed.append(True)
+
+    monkeypatch.setattr("polymaker.engine.Engine", FakeEngine)
+    result = CliRunner().invoke(app, ["run"])
+    assert result.exit_code == 78
+    assert closed == [True]
+    assert "Authoritative startup checks failed" in result.stdout
+
+
 def test_live_self_tests_require_explicit_confirmation() -> None:
     runner = CliRunner()
     assert runner.invoke(app, ["livetest"]).exit_code == 2

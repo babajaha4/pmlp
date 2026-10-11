@@ -1,0 +1,21 @@
+[Unit]
+Description=PolyMaker LIVE market maker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pmlp
+ExecStart=/home/ubuntu/pmlp/.venv/bin/polymaker run --config-dir livecfg --live --confirm-live
+Restart=on-failure
+RestartSec=60s
+RestartPreventExitStatus=78
+KillSignal=SIGINT
+TimeoutStopSec=45s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

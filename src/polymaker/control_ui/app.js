@@ -57,7 +57,11 @@ function renderMetrics(data) {
   const summary = data.summary;
   metric("collateralMetric", money(data.wallet.collateral_pusd, 2));
   metric("equityMetric", `${summary.equity_mtm >= 0 ? "+" : ""}${money(summary.equity_mtm)}`, summary.equity_mtm >= 0 ? "positive" : "negative");
-  metric("dailyPnlMetric", `${summary.daily_pnl_live >= 0 ? "+" : ""}${money(summary.daily_pnl_live)}`, summary.daily_pnl_live >= 0 ? "positive" : "negative");
+  if (summary.daily_pnl_live == null) {
+    metric("dailyPnlMetric", "不可用 · 基准过期或待对账");
+  } else {
+    metric("dailyPnlMetric", `${summary.daily_pnl_live >= 0 ? "+" : ""}${money(summary.daily_pnl_live)}`, summary.daily_pnl_live >= 0 ? "positive" : "negative");
+  }
   const rewards = data.official_liquidity_rewards;
   if (rewards.available) {
     metric("officialRewardMetric", money(rewards.earnings_value, 4), rewards.earnings_value > 0 ? "positive" : undefined);

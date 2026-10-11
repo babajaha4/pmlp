@@ -159,6 +159,8 @@ class BitviseControl:
         binary = shlex.quote(f"{settings.remote_dir}/.venv/bin/polymaker")
         launch = (
             f"sudo systemd-run --unit={unit} --property=Restart=on-failure "
+            f"--property=RestartSec=60s --property=RestartPreventExitStatus=78 "
+            f"--property=StartLimitIntervalSec=3600 --property=StartLimitBurst=5 "
             f"--property=KillSignal=SIGINT --property=User=ubuntu "
             f"--property=TimeoutStopSec=45s "
             f"--working-directory={root} --no-block {binary} run "
@@ -177,12 +179,16 @@ class BitviseControl:
             )
         if action == "restart":
             operation = (
-                f"if systemctl is-active --quiet {unit}; then sudo systemctl restart {unit}; "
+                f"if systemctl cat {unit} >/dev/null 2>&1; then "
+                f"sudo systemctl reset-failed {unit}; sudo systemctl restart {unit}; "
                 f"else {launch}; fi"
             )
         else:
             operation = (
-                f"if ! systemctl is-active --quiet {unit}; then {launch}; fi"
+                f"if ! systemctl is-active --quiet {unit}; then "
+                f"if systemctl cat {unit} >/dev/null 2>&1; then "
+                f"sudo systemctl reset-failed {unit}; sudo systemctl start {unit}; "
+                f"else {launch}; fi; fi"
             )
         return (
             f"set -e; cd {root}; {operation}; {wait_active}; sleep 3; "

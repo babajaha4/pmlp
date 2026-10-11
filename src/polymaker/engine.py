@@ -398,7 +398,10 @@ class Engine:
                 raise GatewayReadError("state changed during authoritative snapshot")
             self._assert_snapshot_revision(revision)
             if onchain_proof is not None:
-                self._require_onchain_snapshot(onchain_proof, positions)
+                if not self._proof_matches_positions(onchain_proof, positions):
+                    await self._verify_newer_onchain_snapshot(onchain_proof, positions, revision)
+                else:
+                    self._require_onchain_snapshot(onchain_proof, positions)
             if require_proof and not self._positions_explained(positions):
                 replayed = await self._sync_confirmed_trades(full_day=True)
                 revision += replayed
@@ -427,6 +430,11 @@ class Engine:
                 if self._load_onchain_proof() != onchain_proof:
                     raise GatewayReadError("retained on-chain proof changed during authoritative snapshot")
                 self._assert_snapshot_revision(revision)
+                if onchain_proof is not None and (
+                    self._load_pending_trades()
+                    or any(self.state.inflight(tok) for tok in self._token_cid)
+                ):
+                    raise GatewayReadError("pending trades prevent on-chain proof recovery")
                 if first and (self._load_pending_trades() or any(
                     self.state.inflight(tok) for tok in self._token_cid
                 )):
@@ -486,6 +494,44 @@ class Engine:
         ) for tok, size in proof.items()):
             self._restore_onchain_exposure(proof)
             raise GatewayReadError("positions disagree with retained on-chain proof")
+
+    @staticmethod
+    def _proof_matches_positions(
+        proof: dict[str, float], positions: dict[str, tuple[float, float]],
+    ) -> bool:
+        return all(math.isclose(
+            positions.get(tok, (0.0, 0.0))[0], size, rel_tol=0.0, abs_tol=1e-6,
+        ) for tok, size in proof.items())
+
+    async def _verify_newer_onchain_snapshot(
+        self, proof: dict[str, float], positions: dict[str, tuple[float, float]], revision: int,
+    ) -> None:
+        """Accept settled inventory changes only with fresh three-way evidence.
+
+        Leave the retained proof untouched until the complete orders/positions
+        reconciliation commits. A read failure or concurrent fill cannot erase it.
+        Never bootstrap an unexplained position through this recovery path.
+        """
+        if (
+            self.state.get_sync_value(_TRADE_SYNC_INITIALIZED) != "1"
+            or self._load_pending_trades()
+            or any(self.state.inflight(tok) for tok in self._token_cid)
+            or not self._positions_explained(positions)
+        ):
+            self._require_onchain_snapshot(proof, positions)
+        fresh = await self.gateway.token_balances(list(proof))
+        self._assert_snapshot_revision(revision)
+        if self._load_onchain_proof() != proof:
+            raise GatewayReadError("retained on-chain proof changed during recovery")
+        if not isinstance(fresh, dict) or set(fresh) != set(proof):
+            raise GatewayReadError("fresh on-chain proof is incomplete")
+        try:
+            verified = {tok: _onchain_size(size) for tok, size in fresh.items()}
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise GatewayReadError("invalid fresh on-chain proof") from exc
+        if not self._proof_matches_positions(verified, positions):
+            raise GatewayReadError("positions disagree with fresh on-chain proof")
+        log.info("onchain_proof_recovery_verified", tokens=len(verified))
 
     def _assert_snapshot_revision(self, revision: int) -> None:
         if self.state.fill_count() != revision:

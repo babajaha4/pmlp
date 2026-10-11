@@ -18,6 +18,96 @@ from tests.test_userstream_parse import FUNDER
 PROOF_KEY = "confirmed_trade_requires_proof"
 
 
+@pytest.fixture(autouse=True)
+def offline_chain(monkeypatch):
+    monkeypatch.setattr(
+        "polymaker.execution.gateway.ExecutionGateway.token_balances",
+        AsyncMock(return_value=None),
+    )
+
+
+@pytest.mark.parametrize("chain", [None, {}, {"yes-token": 50.0},
+                                  {"yes-token": float("nan")}, {"yes-token": 37.5}])
+async def test_settled_sale_recovers_old_proof_only_with_fresh_chain(tmp_path, meta, chain):
+    from polymaker.domain import Fill
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.state.apply_fill(Fill(meta.yes.token_id, Side.BUY, .846, 50, "buy"))
+    eng.state.apply_fill(Fill(meta.yes.token_id, Side.SELL, .846, 12.5, "sell"))
+    eng.state.set_position(meta.yes.token_id, 50, .846)
+    proof = json.dumps({meta.yes.token_id: 50.0})
+    eng.state.set_sync_value(PROOF_KEY, proof)
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (37.5, .846)})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+    eng.gateway.token_balances = AsyncMock(return_value=chain)
+    eng.risk.kill()
+    if chain == {meta.yes.token_id: 37.5}:
+        await eng._reconcile_authoritative_state(startup=True)
+        assert eng.state.get_sync_value(PROOF_KEY) == "0"
+        assert eng.state.position(meta.yes.token_id).size == 37.5
+        assert eng.risk.net_cash == pytest.approx(-31.725)
+        assert eng.risk.global_halt() == (True, "manual_kill")
+    else:
+        with pytest.raises(GatewayReadError):
+            await eng._reconcile_authoritative_state(startup=True)
+        assert eng.state.get_sync_value(PROOF_KEY) == proof
+        assert eng.state.position(meta.yes.token_id).size == 50
+    assert eng.state.fill_count() == 2
+    await eng.shutdown()
+
+
+async def test_new_proof_recovery_retained_when_orders_read_fails(tmp_path, meta):
+    from polymaker.domain import Fill
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.state.apply_fill(Fill(meta.yes.token_id, Side.BUY, .5, 37.5, "buy"))
+    proof = json.dumps({meta.yes.token_id: 50.0})
+    eng.state.set_sync_value(PROOF_KEY, proof)
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (37.5, .5)})
+    eng.gateway.token_balances = AsyncMock(return_value={meta.yes.token_id: 37.5})
+    eng.gateway.open_orders = AsyncMock(side_effect=GatewayReadError("orders unavailable"))
+    with pytest.raises(GatewayReadError, match="orders unavailable"):
+        await eng._reconcile_authoritative_state(startup=True)
+    assert eng.state.get_sync_value(PROOF_KEY) == proof
+    assert eng._state_unknown
+    await eng.shutdown()
+
+
+@pytest.mark.parametrize("change", ["fill", "proof", "pending"])
+async def test_recovery_rejects_state_change_during_fresh_chain_read(tmp_path, meta, change):
+    from polymaker.domain import Fill
+
+    eng = _engine_with_market(tmp_path, meta)
+    eng.state.set_sync_value("confirmed_trade_sync_initialized", "1")
+    eng.state.apply_fill(Fill(meta.yes.token_id, Side.BUY, .5, 37.5, "buy"))
+    proof = json.dumps({meta.yes.token_id: 50.0})
+    eng.state.set_sync_value(PROOF_KEY, proof)
+    eng.gateway.trades = AsyncMock(return_value=[])
+    eng.gateway.positions = AsyncMock(return_value={meta.yes.token_id: (37.5, .5)})
+    eng.gateway.open_orders = AsyncMock(return_value=[])
+
+    async def chain(_tokens):
+        if change == "fill":
+            eng.state.apply_fill(Fill(meta.yes.token_id, Side.SELL, .5, 1, "new-fill"))
+        elif change == "proof":
+            eng.state.set_sync_value(PROOF_KEY, json.dumps({meta.yes.token_id: 51.0}))
+        else:
+            import time
+            eng.state.set_sync_value("confirmed_trade_pending", json.dumps({"new": time.time()}))
+        return {meta.yes.token_id: 37.5}
+
+    eng.gateway.token_balances = chain
+    with pytest.raises(GatewayReadError):
+        await eng._reconcile_authoritative_state(startup=True)
+    assert eng.state.get_sync_value(PROOF_KEY) != "0"
+    assert eng._state_unknown
+    await eng.shutdown()
+
+
 @pytest.mark.parametrize("initialized", [False, True])
 @pytest.mark.parametrize("restart", [False, True])
 async def test_lagging_rest_preserves_onchain_exposure_until_confirmation(
